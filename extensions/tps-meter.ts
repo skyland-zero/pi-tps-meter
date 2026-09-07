@@ -20,7 +20,10 @@
  * Optimizations:
  *   - Fixed ring buffers (no allocations in the streaming repaint path)
  *   - Memoized sparkline (rebuilt once per message, not every tick)
- *   - Single shared 200ms timer, torn down on message_end and agent_end
+ *   - Single shared 200ms timer, torn down on message_end, agent_end,
+ *     and session_shutdown (no orphan timer across /reload)
+ *   - Abort/empty messages restore the last final readout instead of
+ *     leaving a stale live gauge frozen in the footer
  *   - Insertion sort for p95 (cold path, ≤500 elements)
  */
 
@@ -52,6 +55,7 @@ let streamChars = 0;
 let streamTokens = 0;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
 let streaming = false;
+let lastFinal = ""; // last completed readout, restored after aborts/empty msgs
 
 // Rolling window (circular buffer)
 const winBuf = new Float64Array(WINDOW_SIZE * 2);
@@ -363,7 +367,12 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     // Rate is generation-only: from first token to end, excluding TTFT.
     const ref = firstTokenMs > 0 ? firstTokenMs : streamStartMs;
     const elapsed = (now() - ref) / 1000;
-    if (elapsed < 0.1 || tokens === 0) return;
+    // Tiny/empty responses carry no signal — restore the previous final text
+    // instead of leaving a stale live gauge frozen in the footer.
+    if (elapsed < 0.1 || tokens === 0) {
+      ctx.ui.setStatus("tps", lastFinal || undefined);
+      return;
+    }
 
     const tps = tokens / elapsed;
 
@@ -373,13 +382,31 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     sparkPush(tps);
 
     const txt = renderFinal(ctx.ui.theme);
-    if (txt) ctx.ui.setStatus("tps", txt);
+    if (txt) {
+      lastFinal = txt;
+      ctx.ui.setStatus("tps", txt);
+    } else {
+      ctx.ui.setStatus("tps", lastFinal || undefined);
+    }
   });
 
   // Safety net: if a stream is aborted (Esc/Ctrl-C) or errors, message_end may
-  // not fire for that message — agent_end always does. Without this the 200ms
-  // timer would keep repainting a stale live number indefinitely.
-  pi.on("agent_end", async () => {
+  // not fire for that message — agent_end always does. Stop the timer and
+  // restore the last final readout so a stale live gauge isn't left frozen
+  // in the footer. Re-rendering here is idempotent after a normal completion.
+  pi.on("agent_end", async (_event, ctx) => {
+    streaming = false;
+    stopTick();
+    const txt = renderFinal(ctx.ui.theme);
+    if (txt) lastFinal = txt;
+    ctx.ui.setStatus("tps", lastFinal || undefined);
+  });
+
+  // Tear down the tick timer when the session runtime goes away (/reload,
+  // /new, /resume, /fork, quit). Without this, a reload mid-stream would
+  // orphan the old interval: the fresh module scope can't reach it, so it
+  // would keep repainting the footer with a stale ctx indefinitely.
+  pi.on("session_shutdown", async () => {
     streaming = false;
     stopTick();
   });
@@ -403,6 +430,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     sparkDirty = true;
     sparkTheme = null;
     spinI = 0;
+    lastFinal = "";
     ctx.ui.setStatus("tps", undefined);
   });
 }

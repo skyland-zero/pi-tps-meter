@@ -163,6 +163,62 @@ try {
 ok(!crashed && typeof statuses["tps"] === "string", "live ticks render without crashing", `status=${statuses["tps"]}`);
 fire("agent_end", {});
 
+// ============================================================
+// Test 6: abort mid-stream restores the last final readout
+// (regression: used to leave a frozen live gauge in the footer)
+// ============================================================
+fire("session_start", {});
+T = 40000;
+fire("message_start", asst());
+fire("message_update", { ...asst(), assistantMessageEvent: { type: "text_delta", delta: "w".repeat(400) } });
+T = 41000;
+fire("message_end", asst({ usage: { output: 50 } })); // 50 tps final
+const final1 = statuses["tps"];
+ok(typeof final1 === "string" && final1.includes("μ"), "baseline final rendered", `status=${final1}`);
+// Start a new stream and let the live timer paint once
+T = 42000;
+fire("message_start", asst());
+T = 42500;
+fire("message_update", { ...asst(), assistantMessageEvent: { type: "text_delta", delta: "w".repeat(40) } });
+T = 42700;
+(lastIntervalCb as any)?.();
+const live = statuses["tps"];
+ok(live !== final1, "live gauge painted mid-stream", `live=${live}`);
+// Abort: no message_end, only agent_end
+fire("agent_end", {});
+ok(statuses["tps"] === final1, "agent_end restores last final after abort", `status=${statuses["tps"]}`);
+ok(activeTimers === 0, "timer stopped on abort", `active=${activeTimers}`);
+
+// ============================================================
+// Test 7: session_shutdown tears down a live timer (no orphan
+// interval surviving a /reload mid-stream)
+// ============================================================
+fire("session_start", {});
+T = 50000;
+fire("message_start", asst());
+ok(activeTimers === 1, "timer running before shutdown", `active=${activeTimers}`);
+fire("session_shutdown", {});
+ok(activeTimers === 0, "session_shutdown stops live timer", `active=${activeTimers}`);
+
+// ============================================================
+// Test 8: zero-token message mid-session restores last final
+// (regression: used to leave a frozen live gauge)
+// ============================================================
+fire("session_start", {});
+T = 60000;
+fire("message_start", asst());
+fire("message_update", { ...asst(), assistantMessageEvent: { type: "text_delta", delta: "v".repeat(400) } });
+T = 61000;
+fire("message_end", asst({ usage: { output: 50 } }));
+const final2 = statuses["tps"];
+T = 62000;
+fire("message_start", asst());
+T = 62300;
+(lastIntervalCb as any)?.(); // live gauge painted mid-stream
+T = 62350;
+fire("message_end", asst({ usage: { output: 0 } })); // zero tokens -> ignored sample
+ok(statuses["tps"] === final2, "zero-token message restores last final", `status=${statuses["tps"]}`);
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));

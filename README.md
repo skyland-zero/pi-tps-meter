@@ -44,8 +44,9 @@ pi install npm:pi-tps-meter
 
 ## Optimizations
 
-- Single shared 200ms timer, torn down on both `message_end` and `agent_end`
-  (no runaway timer if a stream is aborted)
+- Single shared 200ms timer, torn down on `message_end`, `agent_end`, and
+  `session_shutdown` (no orphan timer across `/reload`; abort/empty messages
+  restore the last final readout instead of freezing the live gauge)
 - Fixed-size circular buffers (no allocations in the streaming repaint path)
 - Memoized sparkline (rebuilt once per message, not on every tick)
 - Insertion sort for p95 (cold path, runs once per message for ≤500 elements)
