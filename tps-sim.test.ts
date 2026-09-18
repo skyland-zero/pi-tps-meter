@@ -219,6 +219,139 @@ T = 62350;
 fire("message_end", asst({ usage: { output: 0 } })); // zero tokens -> ignored sample
 ok(statuses["tps"] === final2, "zero-token message restores last final", `status=${statuses["tps"]}`);
 
+// ============================================================
+// Subagent aggregation (multi-session): a child session reports its
+// live counters into the process-wide hub, and the UI-owning session
+// renders one merged total.
+//
+// Regression guard for the shared-module trap: children in the same cwd
+// re-run this factory against the *same* module instance, so any state at
+// module scope is shared with them (a spawn used to wipe the parent's
+// μ/p95/sparkline and fold child tokens into the parent's counters).
+// ============================================================
+
+/** Build an independent pi instance + ctx for one session. */
+function mkSession(hasUI: boolean, sid: string) {
+  const hmap = new Map<string, Handler>();
+  const status: Record<string, string | undefined> = {};
+  const api = { on: (name: string, h: Handler) => hmap.set(name, h) } as any;
+  const c = {
+    hasUI,
+    sessionManager: { getSessionId: () => sid },
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setStatus: (k: string, v: string | undefined) => {
+        status[k] = v;
+      },
+    },
+  } as any;
+  return { api, c, status, fire: (name: string, event: any) => hmap.get(name)?.(event, c) };
+}
+
+// Park the single-session harness so it stops owning the hub's sink/wake slot.
+fire("session_shutdown", {});
+
+const parent = mkSession(true, "parent-1");
+const child = mkSession(false, "child-1");
+tpsMeter(parent.api);
+tpsMeter(child.api);
+
+// ============================================================
+// Test 9: a subagent spawning must not disturb the parent readout
+// (regression: module-scope state made children wipe the parent's series)
+// ============================================================
+parent.fire("session_start", {});
+T = 70000;
+parent.fire("message_start", asst());
+parent.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "p".repeat(400) },
+});
+T = 71000;
+parent.fire("message_end", asst({ usage: { output: 50 } })); // 50 tps
+const pFinal = parent.status["tps"];
+ok(typeof pFinal === "string" && pFinal.includes("μ"), "parent baseline final rendered", `status=${pFinal}`);
+child.fire("session_start", {}); // <- agent spawn
+ok(
+  parent.status["tps"] === pFinal,
+  "child session_start leaves the parent series intact",
+  `status=${parent.status["tps"]}`,
+);
+
+// ============================================================
+// Test 10: concurrent parent + agent streams merge into one total
+// own:    20 est tokens over 0.5s =  40 tps
+// agent: 100 est tokens over 0.4s = 250 tps
+// total:                           290 tps · 1a
+// ============================================================
+T = 72000;
+parent.fire("message_start", asst());
+T = 72100;
+parent.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "p".repeat(80) },
+});
+child.fire("message_start", asst());
+T = 72200;
+child.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "c".repeat(400) },
+});
+T = 72600;
+(lastIntervalCb as any)?.();
+{
+  const live = parent.status["tps"] ?? "";
+  const total = num(live);
+  ok(live.includes("Σ"), "merged live line marks the aggregate", `live=${live}`);
+  ok(live.includes("· 1a"), "merged live line counts live agents", `live=${live}`);
+  ok(approx(total, 290, 1), "total = parent rate + agent rate", `got ${total} (${live})`);
+}
+
+// ============================================================
+// Test 11: parent settles while the agent still streams
+// (the merged total must keep ticking, and must stop later)
+// ============================================================
+T = 73000;
+parent.fire("message_end", asst({ usage: { output: 40 } }));
+ok(activeTimers === 1, "timer stays up while an agent streams", `active=${activeTimers}`);
+{
+  const live = parent.status["tps"] ?? "";
+  ok(live.includes("Σ") && live.includes("· 1a"), "readout stays merged after the parent settles", `live=${live}`);
+}
+
+// ============================================================
+// Test 12: a settled agent message folds into the parent's series
+// and the child never paints to its own (no-op) UI
+// ============================================================
+T = 74000;
+child.fire("message_end", asst({ usage: { output: 200 } })); // 200 / 1.8s = 111.1 tps
+ok(activeTimers === 0, "no agents left: parent timer stopped", `active=${activeTimers}`);
+{
+  const merged = parent.status["tps"] ?? "";
+  ok(merged.includes("Σ") && merged.includes("μ"), "merged sample marked in the settled readout", `status=${merged}`);
+  ok(child.status["tps"] === undefined, "child never paints to its no-op UI", `child=${child.status["tps"]}`);
+}
+
+// ============================================================
+// Test 13: an agent stream wakes the parent renderer, and the agent's
+// shutdown removes it from the hub
+// ============================================================
+child.fire("session_start", {});
+child.fire("message_start", asst());
+T = 75000;
+child.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "c".repeat(40) },
+});
+ok(activeTimers === 1, "an agent stream wakes the parent renderer", `active=${activeTimers}`);
+T = 75600;
+(lastIntervalCb as any)?.();
+ok((parent.status["tps"] ?? "").includes("· 1a"), "merged line while the agent runs", `status=${parent.status["tps"]}`);
+child.fire("session_shutdown", {});
+ok(activeTimers === 0, "agent shutdown stops the parent renderer", `active=${activeTimers}`);
+ok(!(parent.status["tps"] ?? "").includes("· 1a"), "readout settles back with no agents live", `status=${parent.status["tps"]}`);
+parent.fire("session_shutdown", {});
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));
