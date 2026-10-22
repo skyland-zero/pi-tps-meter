@@ -101,6 +101,14 @@ const MERGE_AGENTS = true;
 const MERGE_STATS = true;
 /** Drop an agent from the hub once it has produced no delta for this long. */
 const AGENT_REAP_MS = 30_000;
+/**
+ * Same idea for an agent that has not produced a single token yet — except that
+ * a session with no tokens is not stalled, it is *waiting*, and reasoning models
+ * routinely take longer than AGENT_REAP_MS to say anything observable. Reaping on
+ * the short timeout silently dropped such an agent from the merged view for the
+ * whole rest of its stream.
+ */
+const AGENT_WAIT_REAP_MS = 600_000;
 /** Deltas between activity-stamp refreshes and hub re-attach checks. */
 const ACTIVITY_EVERY = 16;
 
@@ -456,12 +464,6 @@ function gauge(tps: number, scaleMax: number, theme: any): string {
 // --- Spinner ---
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-let spinI = 0;
-function spin(): string {
-  const s = SPIN[spinI];
-  spinI = (spinI + 1) % SPIN.length;
-  return s;
-}
 
 function speedColor(tps: number, text: string, theme: any): string {
   if (tps >= FAST) return theme.fg("success", text);
@@ -490,6 +492,8 @@ interface LiveTtft {
 /**
  * Live readout: this session's rate, or the merged total when agents are running.
  * `agentSum`/`agentCount` are the live subagents folded in by MERGE_AGENTS.
+ * `glyph` is this session's spinner frame (see the per-session phase in the
+ * factory — a module-level counter would interleave two UI sessions in one cwd).
  * `ttft` is null when this session has no request of its own in flight (a child
  * may still be streaming into the merged total).
  */
@@ -499,13 +503,14 @@ function renderLive(
   own: number,
   agentSum: number,
   agentCount: number,
+  glyph: string,
   ttft: LiveTtft | null,
   theme: any,
 ): string {
   const merged = agentCount > 0;
   const tps = merged ? own + agentSum : own;
 
-  const sp = theme.fg("accent", spin());
+  const sp = theme.fg("accent", glyph);
   const scale = Math.max(s.sparkMax, scaleMax);
 
   // Nothing measurable to draw yet — either the first token has not landed, or
@@ -600,6 +605,17 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   let aggMax = GAUGE_FLOOR;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
   let lastFinal = "";
+  /**
+   * Spinner phase, owned by this session. At module scope two UI sessions in the
+   * same cwd share the module instance (pi caches per cwd), so their frames would
+   * interleave and one session's session_start would reset the other's.
+   */
+  let spinPhase = 0;
+  function spin(): string {
+    const g = SPIN[spinPhase];
+    spinPhase = (spinPhase + 1) % SPIN.length;
+    return g;
+  }
 
   // --- hub wiring (UI-owning session only) ---------------------------------
 
@@ -653,7 +669,11 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     let active = 0;
     let waitMs = 0;
     for (const [key, e] of H.live) {
-      if (nowMs - e.lastActiveMs > AGENT_REAP_MS) {
+      // A token-producing agent that goes quiet is stalled; one that has never
+      // produced a token is still waiting on its first, which can legitimately
+      // take minutes. Same reap, two very different timeouts.
+      const silentFor = nowMs - e.lastActiveMs;
+      if (silentFor > (e.tokens > 0 ? AGENT_REAP_MS : AGENT_WAIT_REAP_MS)) {
         H.live.delete(key); // owner died without a shutdown event
         continue;
       }
@@ -709,7 +729,13 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     const agents = MERGE_AGENTS
       ? agentState(nowMs)
       : { sum: 0, count: 0, active: 0, waitMs: 0 };
-    const own = rate(streamTokens, firstTokenMs > 0 ? firstTokenMs : streamStartMs, nowMs);
+    // Own rate exists only while this session's own message streams. Falling back
+    // to the last message's counters after it settles kept dividing its tokens by
+    // an ever-growing window, so a phantom rate decayed into the merged total
+    // while only the agents were actually producing.
+    const own = streaming
+      ? rate(streamTokens, firstTokenMs > 0 ? firstTokenMs : streamStartMs, nowMs)
+      : 0;
 
     if (streaming || pending() || agents.active > 0) {
       const total = own + agents.sum;
@@ -723,6 +749,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
           own,
           agents.sum,
           agents.count,
+          spin(),
           liveTtft(nowMs, agents.waitMs),
           ctxRef.ui.theme,
         ),
@@ -790,7 +817,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     deltaCount = 0;
     aggMax = GAUGE_FLOOR;
     lastFinal = "";
-    spinI = 0;
+    spinPhase = 0;
     stopTick();
     H.sinks.add(sink);
     H.wake = wake;
@@ -807,10 +834,27 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // the provider starts streaming, so waiting for it would keep the bar frozen
   // for exactly the seconds τ is supposed to expose, and τ would then pop in at
   // whatever value it had already accumulated.
-  pi.on("turn_start", async (event) => {
+  pi.on("turn_start", async (event, ctx) => {
     const ts = typeof event.timestamp === "number" && event.timestamp > 0 ? event.timestamp : now();
     turnAnchorMs = ts;
-    if (!ownsUI) return; // children report, never render or allocate a timer
+
+    if (!ownsUI) {
+      if (!childReports) return;
+      // Publish the wait immediately. Waiting for message_start left the parent's
+      // merged view blind to a subagent's whole pre-message window — the same gap
+      // the UI session had before it started ticking from turn_start.
+      sid ||= sessionId(ctx);
+      entry = ensureEntry();
+      entry.startMs = ts;
+      entry.firstTokenMs = 0;
+      entry.chars = 0;
+      entry.tokens = 0;
+      entry.streaming = true;
+      entry.lastActiveMs = now();
+      H.wake?.();
+      return;
+    }
+
     startTick();
   });
 
@@ -844,7 +888,6 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     streamTokens = 0;
     deltaCount = 0;
     streaming = true;
-    spinI = 0;
     startTick();
   });
 

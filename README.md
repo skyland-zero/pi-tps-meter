@@ -109,8 +109,14 @@ Notes:
   as well as in the parent.
 - An agent counts toward the total while it has a message open, and its tokens
   are dropped the moment that message settles, so a finished agent never keeps
-  inflating the sum. Agents that vanish without a shutdown event are reaped
-  after 30s of silence.
+  inflating the sum. This session's own rate is likewise only counted while its
+  own message streams: a settled parent contributes nothing to a merged total
+  that only the agents are still driving.
+- An agent that has produced **no token yet** is waiting, not stalled — reasoning
+  models routinely take minutes to say anything observable — so it is reaped on a
+  much longer timeout (`AGENT_WAIT_REAP_MS`, 10 min) than one that went quiet
+  mid-stream (`AGENT_REAP_MS`, 30s). Its wait is published at its `turn_start`,
+  so the parent's bar shows a subagent's cold start too, not just its tokens.
 - Session state lives in the factory closure, never at module scope. Pi caches
   an extension module per cwd, so a child in the same cwd re-runs the factory
   against the **same** module instance — module-level counters would be shared
@@ -162,10 +168,14 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 53
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 59
 assertions over the token math, τ anchoring, the pre-message wait window, the
 buffered-replay guard, real-usage-vs-fallback, abort cleanup, sparkline
-memoization, and subagent isolation.
+memoization, merged-total accounting, and subagent isolation.
+
+Known limitation: two UI-owning sessions in the same cwd share one hub, and the
+`wake` slot in it — only the most recently started one is repainted when a
+subagent starts or stops. Both still fold settled samples in via the sink set.
 
 ## Author
 

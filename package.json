@@ -1,6 +1,6 @@
 {
   "name": "pi-tps-meter",
-  "version": "4.0.2",
+  "version": "4.0.3",
   "description": "Tokens per second + time-to-first-token meter for pi CLI — live TTFT (τ), TPS (incl. merged subagent totals), rolling avg, mean, p95",
   "author": "Venkata Sai Chirasani",
   "license": "MIT",

@@ -551,6 +551,122 @@ fire("agent_end", {}); // aborted before any assistant message
 ok(activeTimers === 0, "abort during the wait stops the ticker", `active=${activeTimers}`);
 ok(!(statuses["tps"] ?? "").includes("τ"), "abort during the wait leaves no stuck τ", `status=${statuses["tps"]}`);
 
+// ============================================================
+// Review findings
+// ============================================================
+
+const p3 = mkSession(true, "parent-3");
+const c3 = mkSession(false, "child-3");
+tpsMeter(p3.api);
+tpsMeter(c3.api);
+
+// ============================================================
+// Test 19: a settled parent must not keep contributing its last
+// message's rate to the merged total.
+// own was computed from the previous message's tokens against a
+// window that keeps growing, so a phantom rate decayed into the
+// Σ while only the agent was actually producing.
+// parent: 20 est tokens over 0.5s = 40 tps (then it settles)
+// agent: 100 est tokens over 0.4s = 250 tps
+// expected after the parent settles: Σ250 tps, not Σ290/147
+// ============================================================
+T = 800000;
+p3.fire("session_start", {});
+c3.fire("session_start", {});
+p3.fire("message_start", asst());
+T = 800100;
+p3.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "p".repeat(80) },
+});
+c3.fire("message_start", asst());
+T = 800200;
+c3.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "c".repeat(400) },
+});
+T = 800600;
+(lastIntervalCb as any)?.();
+ok(approx(num(p3.status["tps"]), 290, 1), "both streaming: total includes both", `live=${p3.status["tps"]}`);
+T = 801000;
+p3.fire("message_end", asst({ usage: { output: 40 } })); // parent done, agent still going
+(lastIntervalCb as any)?.();
+{
+  // agent alone: 100 est tokens / 0.8s = 125 tps. A phantom parent rate pushes
+  // this to ~147.
+  const v = num(p3.status["tps"]);
+  ok(approx(v, 125, 1), "settled parent contributes no rate to the merge", `got ${v} (${p3.status["tps"]})`);
+}
+
+// ============================================================
+// Test 20: the parent must see a subagent's PRE-message wait.
+// Same bug class as test 18, one level down: a child that has
+// fired turn_start but has no assistant message yet was not even
+// counted as active, so the parent's bar stayed blank.
+// ============================================================
+c3.fire("message_end", asst({ usage: { output: 100 } }));
+T = 810000;
+c3.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: 810000 });
+T = 814000;
+(lastIntervalCb as any)?.();
+{
+  const live = p3.status["tps"] ?? "";
+  ok(live.includes("τ4.0s"), "parent sees a subagent's pre-message wait", `live=${live}`);
+}
+
+// ============================================================
+// Test 21: a subagent whose first token takes longer than the reap
+// timeout must not be dropped mid-stream. AGENT_REAP_MS exists to
+// catch a dead owner; a session with no tokens is waiting, not dead
+// — and reasoning models can wait minutes.
+// ============================================================
+T = 840000; // 30s after the child's turn_start, still no token
+(lastIntervalCb as any)?.();
+{
+  const live = p3.status["tps"] ?? "";
+  ok(live.includes("τ30.0s"), "a 30s first-token wait is not reaped", `live=${live}`);
+}
+T = 841000;
+c3.fire("message_start", asst());
+c3.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "c".repeat(400) },
+});
+T = 843000;
+(lastIntervalCb as any)?.();
+ok((p3.status["tps"] ?? "").includes("tps"), "the agent's stream still reaches the parent", `live=${p3.status["tps"]}`);
+c3.fire("agent_end", {});
+p3.fire("agent_end", {});
+c3.fire("session_shutdown", {});
+p3.fire("session_shutdown", {});
+
+// ============================================================
+// Test 22: the spinner phase is per-session. It used to live at
+// module scope, so two UI sessions in the same cwd (same module
+// instance — pi caches per cwd) interleaved frames, and one
+// session's session_start reset the other's animation.
+// ============================================================
+const u1 = mkSession(true, "ui-1");
+const u2 = mkSession(true, "ui-2");
+tpsMeter(u1.api);
+tpsMeter(u2.api);
+T = 900000;
+u1.fire("session_start", {});
+u2.fire("session_start", {});
+T = 901000;
+u1.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 901000 });
+(lastIntervalCb as any)?.();
+const g1 = (u1.status["tps"] ?? "")[0];
+// A fresh session's first frame must be the first glyph, not wherever the
+// shared counter had got to.
+T = 902000;
+u2.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 902000 });
+(lastIntervalCb as any)?.();
+const g2 = (u2.status["tps"] ?? "")[0];
+ok(g1 === "⠋" && g2 === "⠋", "spinner phase is per session", `u1=${g1} u2=${g2}`);
+u1.fire("session_shutdown", {});
+u2.fire("session_shutdown", {});
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));
