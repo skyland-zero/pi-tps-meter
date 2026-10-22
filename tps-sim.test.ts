@@ -667,6 +667,55 @@ ok(g1 === "⠋" && g2 === "⠋", "spinner phase is per session", `u1=${g1} u2=${
 u1.fire("session_shutdown", {});
 u2.fire("session_shutdown", {});
 
+// ============================================================
+// Test 23: an agent that has its first token but no measurable
+// rate yet must read as its τ, not `0.0 tps` — the same rule the
+// session applies to itself. It also has to say `· 1a`, or a
+// subagent's wait is indistinguishable from your own.
+// ============================================================
+const p4 = mkSession(true, "parent-4");
+const c4 = mkSession(false, "child-4");
+tpsMeter(p4.api);
+tpsMeter(c4.api);
+T = 1_000_000;
+p4.fire("session_start", {});
+c4.fire("session_start", {});
+c4.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 1_000_000 });
+c4.fire("message_start", asst());
+T = 1_001_000;
+c4.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "c".repeat(400) },
+});
+T = 1_001_200; // only 200ms of signal — `rate()` has nothing usable yet
+(lastIntervalCb as any)?.();
+{
+  const live = p4.status["tps"] ?? "";
+  ok(!live.includes("0.0 tps"), "early agent tokens do not read as 0.0 tps", `live=${live}`);
+  ok(live.includes("τ1.0s") && live.includes("· 1a"), "the agent's τ and count are shown", `live=${live}`);
+}
+T = 1_004_000; // now the rate is measurable
+(lastIntervalCb as any)?.();
+{
+  const live = p4.status["tps"] ?? "";
+  ok(live.includes("Σ") && live.includes("tps"), "a measurable agent rate takes over", `live=${live}`);
+  ok(live.includes("τ1.0s"), "the agent's locked τ rides along", `live=${live}`);
+}
+
+// ============================================================
+// Test 24: an agent that produced tokens and then went silent is
+// reaped (its owner died without a shutdown event) — but only on
+// the short timeout, and only when its live rate would otherwise
+// keep inflating the merged total.
+// ============================================================
+T = 1_020_000;
+(lastIntervalCb as any)?.();
+ok((p4.status["tps"] ?? "").includes("· 1a"), "silent-but-recent agent is still live", `live=${p4.status["tps"]}`);
+T = 1_040_000; // 39s of silence, no shutdown event ever arrives
+(lastIntervalCb as any)?.();
+ok(!(p4.status["tps"] ?? "").includes("· 1a"), "a dead token-producing agent is reaped", `status=${p4.status["tps"]}`);
+p4.fire("session_shutdown", {});
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));

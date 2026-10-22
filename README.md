@@ -115,8 +115,14 @@ Notes:
 - An agent that has produced **no token yet** is waiting, not stalled — reasoning
   models routinely take minutes to say anything observable — so it is reaped on a
   much longer timeout (`AGENT_WAIT_REAP_MS`, 10 min) than one that went quiet
-  mid-stream (`AGENT_REAP_MS`, 30s). Its wait is published at its `turn_start`,
+  mid-stream (`AGENT_REAP_MS`, 30s). An entry left idle by a settle gets the
+  short timeout too, so the longer grace only ever applies to a request that is
+  genuinely still waiting. An agent publishes its wait at its own `turn_start`,
   so the parent's bar shows a subagent's cold start too, not just its tokens.
+- An agent that has its first token but **no measurable rate yet** (under 300ms
+  of signal) reads as its τ plus `· Na`, not as `0.0 tps` — the same rule the
+  session applies to itself. A subagent's wait is therefore never mistaken for
+  your own: yours is bare `τ`, a merged one carries the agent count.
 - Session state lives in the factory closure, never at module scope. Pi caches
   an extension module per cwd, so a child in the same cwd re-runs the factory
   against the **same** module instance — module-level counters would be shared
@@ -168,7 +174,7 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 59
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 65
 assertions over the token math, τ anchoring, the pre-message wait window, the
 buffered-replay guard, real-usage-vs-fallback, abort cleanup, sparkline
 memoization, merged-total accounting, and subagent isolation.

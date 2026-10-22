@@ -108,8 +108,7 @@ const AGENT_REAP_MS = 30_000;
  * the short timeout silently dropped such an agent from the merged view for the
  * whole rest of its stream.
  */
-const AGENT_WAIT_REAP_MS = 600_000;
-/** Deltas between activity-stamp refreshes and hub re-attach checks. */
+const AGENT_WAIT_REAP_MS = 600_000;/** Deltas between activity-stamp refreshes and hub re-attach checks. */
 const ACTIVITY_EVERY = 16;
 
 // --- Sparkline chars (8 vertical levels) ---
@@ -489,48 +488,62 @@ interface LiveTtft {
   waiting: boolean;
 }
 
+/** What the subagents currently report, folded into one snapshot. */
+interface AgentAgg {
+  /** Σ of the measurable agent rates. */
+  sum: number;
+  /** How many agents contribute to `sum`. */
+  count: number;
+  /** How many have a request or a message open. */
+  active: number;
+  /**
+   * Largest τ among active agents: the locked value for one that has produced a
+   * token, a live count for one that has not. 0 when nothing is running.
+   */
+  ttftMs: number;
+}
+
 /**
- * Live readout: this session's rate, or the merged total when agents are running.
- * `agentSum`/`agentCount` are the live subagents folded in by MERGE_AGENTS.
+ * Live readout: this session's rate plus the running agents' rates.
+ * `agents` is the hub snapshot folded in by MERGE_AGENTS.
  * `glyph` is this session's spinner frame (see the per-session phase in the
  * factory — a module-level counter would interleave two UI sessions in one cwd).
- * `ttft` is null when this session has no request of its own in flight (a child
- * may still be streaming into the merged total).
+ * `ttft` is null when nothing is in flight anywhere.
  */
 function renderLive(
   s: Series,
   scaleMax: number,
   own: number,
-  agentSum: number,
-  agentCount: number,
+  agents: AgentAgg,
   glyph: string,
   ttft: LiveTtft | null,
   theme: any,
 ): string {
-  const merged = agentCount > 0;
-  const tps = merged ? own + agentSum : own;
+  const merged = agents.count > 0;
+  const tps = own + agents.sum;
 
   const sp = theme.fg("accent", glyph);
   const scale = Math.max(s.sparkMax, scaleMax);
+  // Only show the live-agent count when it is not already implied by Σ.
+  const liveTail = agents.active > 0 ? ` ${theme.fg("dim", `· ${agents.active}a`)}` : "";
 
-  // Nothing measurable to draw yet — either the first token has not landed, or
-  // it just did and `rate()` has not seen enough elapsed time. Show the wait
-  // itself instead of a `0.0 tps` that reads as a stall. A flat empty gauge plus
-  // a counting τ says "requested, no answer yet" far better than a zero. When a
-  // subagent is already producing, the merged rate is the more useful reading,
-  // so that case falls through to the normal branch with τ appended.
-  if (ttft && agentCount === 0 && (ttft.waiting || tps === 0)) {
+  // Nothing measurable to draw yet — the first token has not landed, or it just
+  // did and `rate()` has not seen enough elapsed time. Show the wait itself
+  // instead of a `0.0 tps` that reads as a stall. A flat empty gauge plus a
+  // counting τ says "requested, no answer yet" far better than a zero. When an
+  // agent is already producing a usable rate, the merged total is the more
+  // useful reading, so that case falls through to the normal branch.
+  if (ttft && !merged && (ttft.waiting || tps === 0)) {
     const t = theme.fg("dim", "τ") + ttftColor(ttft.ms, fmtMs(ttft.ms), theme);
-    return `${sp} ${gauge(0, scale, theme)} ${t}`;
+    return `${sp} ${gauge(0, scale, theme)} ${t}${liveTail}`;
   }
 
   const g = gauge(tps, scale, theme);
   const lead = merged ? theme.fg("dim", "Σ") : "";
   const num = speedColor(tps, fmt(tps), theme);
   const unit = theme.fg("dim", "tps");
-  const tail = merged ? ` ${theme.fg("dim", `· ${agentCount}a`)}` : "";
   const t = ttft ? ` ${theme.fg("dim", "· τ")}${ttftColor(ttft.ms, fmtMs(ttft.ms), theme)}` : "";
-  return `${sp} ${g} ${lead}${num} ${unit}${tail}${t}`;
+  return `${sp} ${g} ${lead}${num} ${unit}${liveTail}${t}`;
 }
 
 function renderFinal(s: Series, ttf: Series, theme: any): string {
@@ -654,62 +667,56 @@ export default function tpsMeter(pi: ExtensionAPI): void {
 
   /**
    * Aggregate of every live agent: `sum` is Σ of the measurable rates, `count`
-   * how many agents contribute to it, `active` how many have a message open
-   * (which is what keeps the renderer's timer alive), `waitMs` the longest wait
-   * among agents that have not produced a token yet (0 when none is waiting).
+   * how many agents contribute to it, `active` how many have a request or message
+   * open (which is what keeps the renderer's timer alive), `ttftMs` the largest
+   * wait among them.
    */
-  function agentState(nowMs: number): {
-    sum: number;
-    count: number;
-    active: number;
-    waitMs: number;
-  } {
+  function agentState(nowMs: number): AgentAgg {
     let sum = 0;
     let count = 0;
     let active = 0;
-    let waitMs = 0;
+    let ttftMs = 0;
     for (const [key, e] of H.live) {
-      // A token-producing agent that goes quiet is stalled; one that has never
-      // produced a token is still waiting on its first, which can legitimately
-      // take minutes. Same reap, two very different timeouts.
-      const silentFor = nowMs - e.lastActiveMs;
-      if (silentFor > (e.tokens > 0 ? AGENT_REAP_MS : AGENT_WAIT_REAP_MS)) {
+      // Three states, three timeouts: waiting on a first token (legitimately
+      // slow for a reasoning model), producing tokens (silence means stalled),
+      // and idle after a settle (leftover, drop it quickly).
+      const limit = e.streaming && e.tokens === 0 ? AGENT_WAIT_REAP_MS : AGENT_REAP_MS;
+      if (nowMs - e.lastActiveMs > limit) {
         H.live.delete(key); // owner died without a shutdown event
         continue;
       }
       if (!e.streaming && e.tokens === 0) continue;
       active++;
-      if (e.tokens === 0) {
-        // Waiting on a first token: report the wait, not a rate of zero.
-        const w = nowMs - e.startMs;
-        if (w > waitMs) waitMs = w;
-        continue;
-      }
+      // Locked τ for an agent that has spoken, live count for one that has not.
+      const agentTtft = e.firstTokenMs > 0 ? e.firstTokenMs - e.startMs : nowMs - e.startMs;
+      if (agentTtft > ttftMs) ttftMs = agentTtft;
+      if (e.tokens === 0) continue;
       const r = rate(e.tokens, e.firstTokenMs > 0 ? e.firstTokenMs : e.startMs, nowMs);
       if (r > 0) {
         sum += r;
         count++;
       }
     }
-    return { sum, count, active, waitMs };
+    return { sum, count, active, ttftMs };
   }
 
   /**
    * TTFT to put on the live bar: this session's own request if it has one, else
-   * a waiting agent's (so a subagent's cold start does not read as `0.0 tps`).
+   * the longest-running agent's (so a subagent's cold start does not read as
+   * `0.0 tps`).
    *
    * The pending window — `turn_start` fired, no assistant message yet — counts
    * too. That is the longest and least forgiving part of the wait (request
    * assembly + provider queueing + prefill) and none of it produces events, so
    * if the bar did not tick here τ would appear late, already large.
    */
-  function liveTtft(nowMs: number, agentWaitMs: number): LiveTtft | null {
+  function liveTtft(nowMs: number, agents: AgentAgg): LiveTtft | null {
     if (streaming && streamStartMs > 0) {
       if (firstTokenMs > 0) return { ms: firstTokenMs - streamStartMs, waiting: false };
       return { ms: nowMs - streamStartMs, waiting: true };
     }
     if (pending()) return { ms: nowMs - turnAnchorMs, waiting: true };
-    if (agentWaitMs > 0) return { ms: agentWaitMs, waiting: true };
+    if (agents.ttftMs > 0) return { ms: agents.ttftMs, waiting: true };
     return null;
   }
 
@@ -726,9 +733,9 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   function paint(): void {
     if (!ownsUI || !ctxRef) return;
     const nowMs = now();
-    const agents = MERGE_AGENTS
+    const agents: AgentAgg = MERGE_AGENTS
       ? agentState(nowMs)
-      : { sum: 0, count: 0, active: 0, waitMs: 0 };
+      : { sum: 0, count: 0, active: 0, ttftMs: 0 };
     // Own rate exists only while this session's own message streams. Falling back
     // to the last message's counters after it settles kept dividing its tokens by
     // an ever-growing window, so a phantom rate decayed into the merged total
@@ -743,16 +750,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       else if (aggMax > GAUGE_FLOOR) aggMax *= 0.995; // slow decay, like sparkMax
       ctxRef.ui.setStatus(
         "tps",
-        renderLive(
-          series,
-          aggMax,
-          own,
-          agents.sum,
-          agents.count,
-          spin(),
-          liveTtft(nowMs, agents.waitMs),
-          ctxRef.ui.theme,
-        ),
+        renderLive(series, aggMax, own, agents, spin(), liveTtft(nowMs, agents), ctxRef.ui.theme),
       );
       startTick();
       return;
