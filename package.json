@@ -1,7 +1,7 @@
 {
   "name": "pi-tps-meter",
-  "version": "3.1.0",
-  "description": "Tokens per second meter for pi CLI — live TPS (incl. merged subagent totals), rolling avg, mean, p95",
+  "version": "4.0.0",
+  "description": "Tokens per second + time-to-first-token meter for pi CLI — live TTFT (τ), TPS (incl. merged subagent totals), rolling avg, mean, p95",
   "author": "Venkata Sai Chirasani",
   "license": "MIT",
   "keywords": [
@@ -9,6 +9,9 @@
     "pi-extension",
     "tps",
     "tokens-per-second",
+    "ttft",
+    "time-to-first-token",
+    "latency",
     "performance"
   ],
   "scripts": {

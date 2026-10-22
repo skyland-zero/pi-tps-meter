@@ -352,6 +352,134 @@ ok(activeTimers === 0, "agent shutdown stops the parent renderer", `active=${act
 ok(!(parent.status["tps"] ?? "").includes("· 1a"), "readout settles back with no agents live", `status=${parent.status["tps"]}`);
 parent.fire("session_shutdown", {});
 
+// ============================================================
+// Time-to-first-token (τ)
+// ============================================================
+
+// ============================================================
+// Test 14: TTFT is anchored at turn_start, so it covers the whole
+// end-to-end wait (prompt assembly included), not just the
+// assistant message's own streaming window.
+// turn_start=99000 -> first delta @103500 => τ = 4.5s
+// decode 103500 -> 108500 = 5.0s, 250 tokens => 50 tps
+// ============================================================
+fire("session_start", {});
+T = 100000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 99000 });
+fire("message_start", asst());
+T = 103500;
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "q".repeat(400) },
+});
+T = 108500;
+fire("message_end", asst({ usage: { output: 250 } }));
+{
+  const st = statuses["tps"] ?? "";
+  const v = num(st);
+  ok(st.includes("τ4.5s"), "τ measured from turn_start (end-to-end)", `status=${st}`);
+  ok(approx(v, 50), "decode rate still starts at the first token, not turn_start", `got ${v} (${st})`);
+}
+
+// ============================================================
+// Test 15: while waiting for the first token the bar counts τ up
+// and shows no tps at all (regression: used to read `0.0 tps`,
+// which looked like a stall)
+// ============================================================
+fire("session_start", {});
+T = 200000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 200000 });
+fire("message_start", asst());
+T = 201000;
+(lastIntervalCb as any)?.();
+{
+  const live = statuses["tps"] ?? "";
+  ok(live.includes("τ1.0s"), "waiting bar counts τ up", `live=${live}`);
+  ok(!live.includes("tps"), "waiting bar shows no rate", `live=${live}`);
+}
+T = 203500;
+(lastIntervalCb as any)?.();
+ok((statuses["tps"] ?? "").includes("τ3.5s"), "τ keeps counting during the wait", `live=${statuses["tps"]}`);
+// first token lands -> τ locks and the rate readout appears next to it
+T = 204000;
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "r".repeat(400) },
+});
+T = 206000;
+(lastIntervalCb as any)?.();
+{
+  const live = statuses["tps"] ?? "";
+  ok(live.includes("tps") && live.includes("τ4.0s"), "first token locks τ and starts the rate", `live=${live}`);
+}
+fire("agent_end", {});
+
+// ============================================================
+// Test 16: buffered replay is rejected from the tps series but
+// its TTFT is still recorded.
+// 22s wait, then 1000 tokens flushed in 0.9s would read as 1147 tps
+// ============================================================
+fire("session_start", {});
+T = 300000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 300000 });
+fire("message_start", asst());
+T = 322000;
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "b".repeat(4000) },
+});
+T = 322900;
+fire("message_end", asst({ usage: { output: 1000 } }));
+{
+  const st = statuses["tps"] ?? "";
+  ok(!st.includes("tps"), "buffered replay contributes no tps sample", `status=${st}`);
+  ok(st.includes("τ22.0s"), "buffered replay still records its TTFT", `status=${st}`);
+}
+// …and a normal message afterwards is unaffected
+T = 330000;
+fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: 330000 });
+fire("message_start", asst());
+T = 331000;
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "n".repeat(400) },
+});
+T = 333000;
+fire("message_end", asst({ usage: { output: 50 } }));
+{
+  const st = statuses["tps"] ?? "";
+  ok(st.includes("tps"), "a normal turn still produces a sample", `status=${st}`);
+  ok(st.includes("τ11.5s"), "τ mean covers both turns", `status=${st}`);
+}
+
+// ============================================================
+// Test 17: a subagent's TTFT folds into the parent's τ mean
+// ============================================================
+const p2 = mkSession(true, "parent-2");
+const c2 = mkSession(false, "child-2");
+tpsMeter(p2.api);
+tpsMeter(c2.api);
+T = 400000;
+p2.fire("session_start", {});
+c2.fire("session_start", {});
+c2.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 400000 });
+T = 401000;
+c2.fire("message_start", asst());
+T = 405000; // 5.0s TTFT (400000 -> 405000)
+c2.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "s".repeat(400) },
+});
+T = 411000; // 6.0s decode, 100 real tokens => 16.7 tps
+c2.fire("message_end", asst({ usage: { output: 100 } }));
+{
+  const st = p2.status["tps"] ?? "";
+  ok(st.includes("Σ"), "agent sample marks the parent series", `status=${st}`);
+  ok(st.includes("τ5.0s"), "agent TTFT folds into the parent τ mean", `status=${st}`);
+}
+c2.fire("session_shutdown", {});
+p2.fire("session_shutdown", {});
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));

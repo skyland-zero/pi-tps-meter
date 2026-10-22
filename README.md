@@ -1,6 +1,7 @@
 # pi-tps-meter
 
-Tokens per second meter for [pi CLI](https://pi.dev) with sparkline visualization.
+Tokens per second meter for [pi CLI](https://pi.dev) with time-to-first-token,
+sparkline visualization, and subagent aggregation.
 
 ## Install
 
@@ -10,29 +11,61 @@ pi install npm:pi-tps-meter
 
 ## Features
 
-**During streaming** — a smooth, animated gauge that fills with live speed
-(1/8-cell resolution, auto-scaled to your session's peak):
+**While waiting for the first token** — τ counts up live, so the wait is visible
+*while it happens* instead of looking like a stall:
 ```
-⠹ ▕███████▋···▏ 47 tps
+⠹ ▕···········▏ τ1.4s
+```
+
+**During streaming** — a smooth, animated gauge that fills with live speed
+(1/8-cell resolution, auto-scaled to your session's peak), with the locked τ:
+```
+⠹ ▕███████▋···▏ 47 tps · τ0.8s
 ```
 
 **After a message** — a min-max normalized sparkline of your last 12 messages
-(newest on the right) plus aggregate stats:
+(newest on the right) plus aggregate stats and the mean τ:
 ```
-▁▄▇▅▂▁▇█▅▃▆▇ 42 tps · μ 39 · p95 61
+▁▄▇▅▂▁▇█▅▃▆▇ 42 tps · μ 39 · p95 61 · τ0.9s
 ```
 
 **With subagents running** ([`@gotgenes/pi-subagents`](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-subagents)
 and other in-process subagent cores) — one merged total across the parent and
 every live agent, so N concurrent agents read as a single number:
 ```
-⠹ ▕████████▊··▏ Σ 168 tps · 3a
+⠹ ▕████████▊··▏ Σ 168 tps · 3a · τ0.8s
 ```
 
-**Color coding:**
-- 🟢 Green: >50 tps (fast)
-- 🟡 Yellow: 20-50 tps (medium)
-- 🔴 Red: <20 tps (slow)
+**Color coding** (τ uses its own scale — a wait is not a rate):
+
+| | tps | τ |
+| --- | --- | --- |
+| 🟢 Green | >50 tps | <1s |
+| 🟡 Yellow | 20–50 tps | 1–3s |
+| 🔴 Red | <20 tps | ≥3s |
+
+## Time to first token (τ)
+
+Two numbers describe a response, and they fail in opposite directions: τ is how
+long you sit there with nothing on screen, tps is how fast it then arrives.
+
+- **Anchor** is `turn_start`, the event pi emits *before* it assembles the
+  request. So τ covers the whole end-to-end wait the user feels — context
+  assembly, provider queueing, prompt prefill, reasoning preamble — not just the
+  assistant message's own streaming window. If a message arrives with no turn
+  boundary before it, the anchor falls back to `message_start`.
+- **First token** is the first non-empty `text_delta`, `thinking_delta`, or
+  `toolcall_delta`. Metadata events (`*_start`, empty deltas) do not stop the
+  wait. A reasoning model's thinking counts as an answer arriving, which is what
+  you actually observe.
+- **Live vs settled**: while a request is in flight the bar shows the *current*
+  turn's τ counting up, then locking; the settled readout shows the *mean* τ
+  across the session, next to μ and p95. Same split the tps number already used.
+- **Buffered replay guard**: a long τ followed by a flood of tokens is the
+  upstream flushing a finished answer, not a decode rate — 22s of waiting then
+  1000 tokens in 0.9s would otherwise read as an impossible 1147 tps. Decode
+  windows shorter than 200ms, or shorter than half a τ above 1s, are dropped
+  from the tps series. **Their τ is still recorded**, because the wait was real.
 
 ## Subagents
 
@@ -47,6 +80,10 @@ never draw. This extension therefore splits the work:
   with `Σ` and the live agent count (`· 3a`). When everything has settled it
   paints the usual sparkline/avg/μ/p95 readout, prefixed with `Σ` once subagent
   messages are part of that series.
+
+A child that is still waiting for its first token has no rate to report, so the
+parent shows the longest such wait as τ rather than `Σ0.0 tps`. Settled agent
+messages fold their τ into the parent's mean as well.
 
 Two constants at the top of `extensions/tps-meter.ts` tune it:
 
@@ -84,15 +121,19 @@ Notes:
 - Uses the provider's **real** output token count (`message.usage.output`); the
   char/4 estimate is only a fallback for providers that don't report usage
 - Rate is measured from the **first token**, so time-to-first-token (network/queue
-  latency) doesn't drag down the reported tps
-- Tracks **thinking tokens** (`thinking_delta`) alongside text, so models with
-  extended thinking report accurate generation speed
+  latency) doesn't drag down the reported tps — that latency is reported as τ
+  instead of being thrown away
+- Tracks **thinking tokens** (`thinking_delta`) alongside text and tool-call
+  arguments, so models with extended thinking report accurate generation speed
 
 ## Stats
 
 - **avg**: rolling 60-second window (resets older samples)
 - **μ**: all-time mean across the session
 - **p95**: 95th percentile, all-time (up to 500 samples)
+- **τ**: mean time-to-first-token across the session, from its own series
+  (tps and τ histories are maintained independently, so a turn whose rate was
+  rejected still contributes its wait)
 
 ## Optimizations
 
@@ -103,6 +144,18 @@ Notes:
 - Fixed-size circular buffers (no allocations in the streaming repaint path)
 - Memoized sparkline (rebuilt once per message, not on every tick)
 - Insertion sort for p95 (cold path, runs once per message for ≤500 elements)
+
+## Test
+
+```bash
+npm test
+```
+
+`tps-sim.test.ts` drives the extension through pi's real event sequence with a
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 42
+assertions over the token math, τ anchoring, the buffered-replay guard,
+real-usage-vs-fallback, abort cleanup, sparkline memoization, and subagent
+isolation.
 
 ## Author
 

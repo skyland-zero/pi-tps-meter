@@ -1,13 +1,17 @@
 /**
- * TPS Meter v4 — Tokens Per Second, Sparkline Trend, Subagent Aggregation
+ * TPS Meter v5 — Tokens Per Second, Time-To-First-Token, Sparkline, Subagents
  *
  * Footer display:
- *   Streaming:          ⠹ ▕███████▋···▏ 47 tps
- *   With N agents live: ⠹ ▕████████▊··▏ Σ 168 tps · 3a
- *   Complete:           ▁▄▇▅▂▁▇█▅▃▆▇ 42 tps · μ 39 · p95 61
- *   Complete, merged:   ▁▄▇▅▂▁▇█▅▃▆▇ Σ 42 tps · μ 39 · p95 61
+ *   Waiting for τ:      ⠹ ▕···········▏ τ1.4s
+ *   Streaming:          ⠹ ▕███████▋···▏ 47 tps · τ0.8s
+ *   With N agents live: ⠹ ▕████████▊··▏ Σ 168 tps · 3a · τ0.8s
+ *   Complete:           ▁▄▇▅▂▁▇█▅▃▆▇ 42 tps · μ 39 · p95 61 · τ0.9s
+ *   Complete, merged:   ▁▄▇▅▂▁▇█▅▃▆▇ Σ 42 tps · μ 39 · p95 61 · τ0.9s
  *
  * Features:
+ *   - Time-to-first-token (τ): counts up while the request is in flight so the
+ *     wait is visible *while it happens*, locks on the first delta, and averages
+ *     into the settled readout alongside μ/p95
  *   - Live sub-cell gauge (1/8-cell resolution) that fills as you stream
  *   - Min-max normalized sparkline (▁▂▃▄▅▆▇█) so the trend's shape is readable
  *   - Color-coded by speed (green fast / yellow mid / red slow)
@@ -33,6 +37,14 @@
  *     every settled message, parent or child; char/4 estimate is only the live
  *     fallback while a message is still streaming
  *   - Rate measured from first token (excludes time-to-first-token latency)
+ *   - TTFT is anchored at `turn_start` — the event pi emits *before* the request
+ *     is assembled — so it is the end-to-end wait the user actually feels, not
+ *     just the time spent inside the provider call. Falls back to the assistant
+ *     `message_start` if no turn boundary preceded the message.
+ *   - Buffered-replay guard: a long TTFT followed by a flood of tokens is the
+ *     provider flushing the whole answer at once, not a decode rate (22s TTFT
+ *     then 1000 tokens in 0.9s would read as an impossible 1147 tps). Such
+ *     samples still contribute their TTFT but are dropped from the tps series.
  *
  * Performance:
  *   - The per-delta path stays allocation-free and clock-free: one string-length
@@ -57,6 +69,19 @@ const SPARK_LEN = 12;
 const ALLTIME_CAP = 500;
 const FAST = 50;
 const MED = 20;
+
+/**
+ * TTFT color thresholds (green under TTFT_FAST_MS, red at/above TTFT_MED_MS).
+ * Generous compared to the tps scale: a second to first token is normal, and the
+ * point of the readout is to flag the pathological multi-second waits.
+ */
+const TTFT_FAST_MS = 1_000;
+const TTFT_MED_MS = 3_000;
+/**
+ * Shortest decode window that carries a usable rate signal. Below this the
+ * denominator is noise (first-token jitter, a single flushed chunk).
+ */
+const MIN_DECODE_MS = 200;
 
 /** Fold concurrent subagent throughput into this session's footer total. */
 const MERGE_AGENTS = true;
@@ -88,7 +113,10 @@ const TRACK = "·"; // faint empty-track glyph (less janky than blank space)
  * the hot path is a few field writes — no lookups, no allocation.
  */
 interface AgentLive {
-  /** Message start (fallback reference point when no delta has arrived yet). */
+  /**
+   * Request anchor: the turn's `turn_start` timestamp (end-to-end TTFT), or the
+   * assistant `message_start` when no turn boundary preceded the message.
+   */
   startMs: number;
   /** First delta of the current message; 0 until one arrives. */
   firstTokenMs: number;
@@ -107,8 +135,11 @@ interface AgentLive {
 
 /** A settled (completed) message, published to every UI-owning session. */
 interface SettledSample {
+  /** Decode rate; 0 when the sample was rejected as buffered replay. */
   tps: number;
   tokens: number;
+  /** End-to-end TTFT of that message in ms; 0 when the first token never came. */
+  ttftMs: number;
 }
 
 interface Hub {
@@ -215,26 +246,52 @@ function rate(tokens: number, refMs: number, nowMs: number): number {
   return elapsed > 0.3 ? tokens / elapsed : 0;
 }
 
+/**
+ * Is a decode window a believable generation rate?
+ *
+ * Two rejections, both about a denominator that carries no signal:
+ *   - shorter than MIN_DECODE_MS: first-token jitter dominates the quotient.
+ *   - shorter than half a long TTFT: the classic gateway-buffered replay, where
+ *     the upstream holds the finished answer and flushes it in one burst. The
+ *     numerator is real but the elapsed time is not the generation time, so the
+ *     quotient is fiction (22s TTFT + 1000 tokens in 0.9s = "1147 tps").
+ *
+ * The TTFT itself stays trustworthy in both cases — only the rate is dropped.
+ */
+function tpsTrustworthy(decodeMs: number, ttftMs: number): boolean {
+  if (decodeMs < MIN_DECODE_MS) return false;
+  return !(ttftMs >= TTFT_FAST_MS && decodeMs < ttftMs * 0.5);
+}
+
 function fmt(v: number): string {
   if (v < 10) return v.toFixed(1);
   if (v < 100) return v.toFixed(0);
   return `${Math.round(v)}`;
 }
 
-function seriesPush(s: Series, tps: number): void {
-  // Rolling window
+/** Milliseconds as a compact human latency: `840ms`, `1.4s`, `12.6s`. */
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Push a sample onto the rolling + all-time buffers, leaving the sparkline alone. */
+function statPush(s: Series, v: number): void {
   const b = s.winHead * 2;
-  s.win[b] = tps;
+  s.win[b] = v;
   s.win[b + 1] = now();
   s.winHead = (s.winHead + 1) % WINDOW_SIZE;
   if (s.winLen < WINDOW_SIZE) s.winLen++;
 
-  // All-time
-  s.atSum += tps;
+  s.atSum += v;
   if (s.atLen >= ALLTIME_CAP) s.atSum -= s.at[s.atHead];
-  s.at[s.atHead] = tps;
+  s.at[s.atHead] = v;
   s.atHead = (s.atHead + 1) % ALLTIME_CAP;
   if (s.atLen < ALLTIME_CAP) s.atLen++;
+}
+
+function seriesPush(s: Series, tps: number): void {
+  statPush(s, tps);
 
   // Sparkline
   s.spark[s.sparkHead] = tps;
@@ -395,8 +452,28 @@ function speedColor(tps: number, text: string, theme: any): string {
 }
 
 /**
+ * Latency color: a wait is judged on its own scale, not the tps one. Green as
+ * soon as the model starts talking quickly, red once you are clearly waiting on
+ * a slow provider, a cold prompt, or a long reasoning preamble.
+ */
+function ttftColor(ms: number, text: string, theme: any): string {
+  if (ms < TTFT_FAST_MS) return theme.fg("success", text);
+  if (ms < TTFT_MED_MS) return theme.fg("warning", text);
+  return theme.fg("error", text);
+}
+
+/** Live TTFT: `ms` counts up while waiting, then locks at the real value. */
+interface LiveTtft {
+  ms: number;
+  /** True until the first token lands — there is no rate to show yet. */
+  waiting: boolean;
+}
+
+/**
  * Live readout: this session's rate, or the merged total when agents are running.
  * `agentSum`/`agentCount` are the live subagents folded in by MERGE_AGENTS.
+ * `ttft` is null when this session has no request of its own in flight (a child
+ * may still be streaming into the merged total).
  */
 function renderLive(
   s: Series,
@@ -404,28 +481,54 @@ function renderLive(
   own: number,
   agentSum: number,
   agentCount: number,
+  ttft: LiveTtft | null,
   theme: any,
 ): string {
   const merged = agentCount > 0;
   const tps = merged ? own + agentSum : own;
 
-  // Live, animated, sub-cell gauge that fills as generation speeds up — this is
-  // the moving "graph" during streaming (the historical sparkline is static).
   const sp = theme.fg("accent", spin());
-  const g = gauge(tps, Math.max(s.sparkMax, scaleMax), theme);
+  const scale = Math.max(s.sparkMax, scaleMax);
+
+  // Nothing measurable to draw yet — either the first token has not landed, or
+  // it just did and `rate()` has not seen enough elapsed time. Show the wait
+  // itself instead of a `0.0 tps` that reads as a stall. A flat empty gauge plus
+  // a counting τ says "requested, no answer yet" far better than a zero. When a
+  // subagent is already producing, the merged rate is the more useful reading,
+  // so that case falls through to the normal branch with τ appended.
+  if (ttft && agentCount === 0 && (ttft.waiting || tps === 0)) {
+    const t = theme.fg("dim", "τ") + ttftColor(ttft.ms, fmtMs(ttft.ms), theme);
+    return `${sp} ${gauge(0, scale, theme)} ${t}`;
+  }
+
+  const g = gauge(tps, scale, theme);
   const lead = merged ? theme.fg("dim", "Σ") : "";
   const num = speedColor(tps, fmt(tps), theme);
   const unit = theme.fg("dim", "tps");
   const tail = merged ? ` ${theme.fg("dim", `· ${agentCount}a`)}` : "";
-  return `${sp} ${g} ${lead}${num} ${unit}${tail}`;
+  const t = ttft ? ` ${theme.fg("dim", "· τ")}${ttftColor(ttft.ms, fmtMs(ttft.ms), theme)}` : "";
+  return `${sp} ${g} ${lead}${num} ${unit}${tail}${t}`;
 }
 
-function renderFinal(s: Series, theme: any): string {
+function renderFinal(s: Series, ttf: Series, theme: any): string {
   const avg = seriesAvg(s);
   const mu = seriesMean(s);
-  const p95 = seriesP95(s);
-  if (avg === 0 && mu === 0) return "";
+  // Mean TTFT sits next to μ/p95 as the same kind of number: a session summary.
+  // (Live shows the current turn's τ; settled shows the average of all turns.)
+  const meanTtft = seriesMean(ttf);
+  const t = meanTtft > 0
+    ? ` ${theme.fg("dim", "· τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
+    : "";
 
+  if (avg === 0 && mu === 0) {
+    // No usable rate (every sample rejected, or nothing settled yet) — but a
+    // measured wait is still a real data point, so do not throw it away.
+    return meanTtft > 0
+      ? `${theme.fg("dim", "τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
+      : "";
+  }
+
+  const p95 = seriesP95(s);
   const sp = sparkline(s, theme);
   // Σ marks a series that also contains subagent messages (MERGE_STATS).
   const lead = s.merged > 0 ? theme.fg("dim", "Σ ") : "";
@@ -435,7 +538,7 @@ function renderFinal(s: Series, theme: any): string {
   const p = `${theme.fg("dim", "p95")} ${speedColor(p95, fmt(p95), theme)}`;
   const label = theme.fg("dim", "tps");
 
-  return `${sp} ${lead}${a} ${label} ${sep} ${m} ${sep} ${p}`;
+  return `${sp} ${lead}${a} ${label} ${sep} ${m} ${sep} ${p}${t}`;
 }
 
 // ============================
@@ -461,12 +564,17 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // sessions (pi caches a module per cwd), so anything belonging to *this*
   // session lives here and nowhere else.
   const series = newSeries();
+  /** Parallel series for time-to-first-token (ms), so τ has its own mean. */
+  const ttftSeries = newSeries();
   let ownsUI = true;
   let ctxRef: any = null;
   let sid = "";
   let entry: AgentLive | null = null;
   let streaming = false;
+  /** Request anchor: `turn_start` when known, else the assistant message start. */
   let streamStartMs = 0;
+  /** Unconsumed `turn_start` timestamp for the request that has not landed yet. */
+  let turnAnchorMs = 0;
   let firstTokenMs = 0;
   let streamChars = 0;
   let streamTokens = 0;
@@ -481,8 +589,12 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   const sink = (sample: SettledSample): void => {
     if (!ownsUI) return;
     if (MERGE_STATS) {
-      seriesPush(series, sample.tps);
-      series.merged++;
+      // A rejected rate (buffered replay) still carries a valid TTFT.
+      if (sample.tps > 0) {
+        seriesPush(series, sample.tps);
+        series.merged++;
+      }
+      if (sample.ttftMs > 0) statPush(ttftSeries, sample.ttftMs);
     }
     paint();
   };
@@ -509,12 +621,19 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   /**
    * Aggregate of every live agent: `sum` is Σ of the measurable rates, `count`
    * how many agents contribute to it, `active` how many have a message open
-   * (which is what keeps the renderer's timer alive).
+   * (which is what keeps the renderer's timer alive), `waitMs` the longest wait
+   * among agents that have not produced a token yet (0 when none is waiting).
    */
-  function agentState(nowMs: number): { sum: number; count: number; active: number } {
+  function agentState(nowMs: number): {
+    sum: number;
+    count: number;
+    active: number;
+    waitMs: number;
+  } {
     let sum = 0;
     let count = 0;
     let active = 0;
+    let waitMs = 0;
     for (const [key, e] of H.live) {
       if (nowMs - e.lastActiveMs > AGENT_REAP_MS) {
         H.live.delete(key); // owner died without a shutdown event
@@ -522,23 +641,42 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       }
       if (!e.streaming && e.tokens === 0) continue;
       active++;
-      if (e.tokens === 0) continue;
+      if (e.tokens === 0) {
+        // Waiting on a first token: report the wait, not a rate of zero.
+        const w = nowMs - e.startMs;
+        if (w > waitMs) waitMs = w;
+        continue;
+      }
       const r = rate(e.tokens, e.firstTokenMs > 0 ? e.firstTokenMs : e.startMs, nowMs);
       if (r > 0) {
         sum += r;
         count++;
       }
     }
-    return { sum, count, active };
+    return { sum, count, active, waitMs };
+  }
+
+  /**
+   * TTFT to put on the live bar: this session's own request if it has one, else
+   * a waiting agent's (so a subagent's cold start does not read as `0.0 tps`).
+   */
+  function liveTtft(nowMs: number, agentWaitMs: number): LiveTtft | null {
+    if (streaming && streamStartMs > 0) {
+      if (firstTokenMs > 0) return { ms: firstTokenMs - streamStartMs, waiting: false };
+      return { ms: nowMs - streamStartMs, waiting: true };
+    }
+    if (agentWaitMs > 0) return { ms: agentWaitMs, waiting: true };
+    return null;
   }
 
   /** Single render entry point: live while anything streams, else settled final. */
   function paint(): void {
     if (!ownsUI || !ctxRef) return;
     const nowMs = now();
-    const agents = MERGE_AGENTS ? agentState(nowMs) : { sum: 0, count: 0, active: 0 };
+    const agents = MERGE_AGENTS
+      ? agentState(nowMs)
+      : { sum: 0, count: 0, active: 0, waitMs: 0 };
     const own = rate(streamTokens, firstTokenMs > 0 ? firstTokenMs : streamStartMs, nowMs);
-    const merged = agents.count > 0;
 
     if (streaming || agents.active > 0) {
       const total = own + agents.sum;
@@ -546,13 +684,21 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       else if (aggMax > GAUGE_FLOOR) aggMax *= 0.995; // slow decay, like sparkMax
       ctxRef.ui.setStatus(
         "tps",
-        renderLive(series, aggMax, own, agents.sum, agents.count, ctxRef.ui.theme),
+        renderLive(
+          series,
+          aggMax,
+          own,
+          agents.sum,
+          agents.count,
+          liveTtft(nowMs, agents.waitMs),
+          ctxRef.ui.theme,
+        ),
       );
       startTick();
       return;
     }
 
-    const txt = renderFinal(series, ctxRef.ui.theme);
+    const txt = renderFinal(series, ttftSeries, ctxRef.ui.theme);
     if (txt) lastFinal = txt;
     ctxRef.ui.setStatus("tps", txt || lastFinal || undefined);
     stopTick();
@@ -601,8 +747,10 @@ export default function tpsMeter(pi: ExtensionAPI): void {
 
     // Parent: private series reset, and become the hub's renderer.
     resetSeries(series);
+    resetSeries(ttftSeries);
     streaming = false;
     streamStartMs = 0;
+    turnAnchorMs = 0;
     firstTokenMs = 0;
     streamChars = 0;
     streamTokens = 0;
@@ -616,15 +764,30 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     ctxRef.ui.setStatus("tps", undefined);
   });
 
+  // `turn_start` is emitted before pi assembles the request, so anchoring TTFT
+  // here measures the wait the user actually sits through — including prompt
+  // assembly and any provider-side queueing — instead of only the assistant
+  // message's own streaming window. The anchor is consumed by the next assistant
+  // `message_start` (one turn = one model request = one assistant message).
+  pi.on("turn_start", async (event) => {
+    const ts = typeof event.timestamp === "number" && event.timestamp > 0 ? event.timestamp : now();
+    turnAnchorMs = ts;
+  });
+
   pi.on("message_start", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     ctxRef ??= ctx;
+
+    // Consume the turn anchor (one turn = one model request = one assistant
+    // message); fall back to now if this message had no turn boundary.
+    const anchor = turnAnchorMs > 0 ? turnAnchorMs : now();
+    turnAnchorMs = 0;
 
     if (!ownsUI) {
       if (!childReports) return;
       sid ||= sessionId(ctx);
       entry = ensureEntry();
-      entry.startMs = now();
+      entry.startMs = anchor;
       entry.firstTokenMs = 0;
       entry.chars = 0;
       entry.tokens = 0;
@@ -635,7 +798,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       return;
     }
 
-    streamStartMs = now();
+    streamStartMs = anchor;
     firstTokenMs = 0;
     streamChars = 0;
     streamTokens = 0;
@@ -696,10 +859,14 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       const realOut = event.message?.usage?.output;
       const tokens = typeof realOut === "number" && realOut > 0 ? realOut : entry.tokens;
       const ref = entry.firstTokenMs > 0 ? entry.firstTokenMs : entry.startMs;
-      const elapsedMs = now() - ref;
+      const decodeMs = now() - ref;
+      // TTFT is measured against the request anchor, not the first delta, so it
+      // stays valid even when the decode rate is rejected below.
+      const ttftMs = entry.firstTokenMs > 0 ? entry.firstTokenMs - entry.startMs : 0;
       idleEntry();
-      if (MERGE_STATS && elapsedMs >= 100 && tokens > 0) {
-        const sample: SettledSample = { tps: tokens / (elapsedMs / 1000), tokens };
+      if (MERGE_STATS && (tokens > 0 || ttftMs > 0)) {
+        const rate = tpsTrustworthy(decodeMs, ttftMs) && tokens > 0 ? tokens / (decodeMs / 1000) : 0;
+        const sample: SettledSample = { tps: rate, tokens, ttftMs };
         for (const fn of H.sinks) fn(sample);
       }
       H.wake?.();
@@ -710,12 +877,16 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     const realOut = event.message?.usage?.output;
     const tokens = typeof realOut === "number" && realOut > 0 ? realOut : streamTokens;
     const ref = firstTokenMs > 0 ? firstTokenMs : streamStartMs;
-    const elapsedMs = now() - ref;
+    const decodeMs = now() - ref;
+    const ttftMs = firstTokenMs > 0 ? firstTokenMs - streamStartMs : 0;
 
-    // Tiny/empty responses carry no signal — keep the previous final readout
-    // instead of leaving a stale live gauge in the footer.
-    if (elapsedMs >= 100 && tokens > 0) {
-      seriesPush(series, tokens / (elapsedMs / 1000));
+    // A wait with no answer is still a data point: record the TTFT even when the
+    // rate is unusable (tiny/empty response, buffered replay).
+    if (ttftMs > 0) statPush(ttftSeries, ttftMs);
+    // Tiny/empty responses carry no rate signal — keep the previous final
+    // readout instead of leaving a stale live gauge in the footer.
+    if (tokens > 0 && tpsTrustworthy(decodeMs, ttftMs)) {
+      seriesPush(series, tokens / (decodeMs / 1000));
     }
     paint();
   });
