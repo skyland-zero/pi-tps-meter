@@ -547,8 +547,15 @@ function renderLive(
 }
 
 function renderFinal(s: Series, ttf: Series, theme: any): string {
-  const avg = seriesAvg(s);
   const mu = seriesMean(s);
+  // The rolling window is empty after a minute of idling, and averaging nothing
+  // used to yield 0 — so an abort (or any repaint) after a pause made the
+  // headline read `0.0 tps` for a session with a perfectly good history, and
+  // that string then became `lastFinal`, sticking until the next message.
+  // Fall back to the mean: the settled readout describes the session, it must
+  // never claim a rate of zero that nothing is actually producing.
+  const windowAvg = seriesAvg(s);
+  const avg = windowAvg > 0 ? windowAvg : mu;
   // Mean TTFT sits next to μ/p95 as the same kind of number: a session summary.
   // (Live shows the current turn's τ; settled shows the average of all turns.)
   const meanTtft = seriesMean(ttf);
@@ -556,9 +563,9 @@ function renderFinal(s: Series, ttf: Series, theme: any): string {
     ? ` ${theme.fg("dim", "· τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
     : "";
 
-  if (avg === 0 && mu === 0) {
-    // No usable rate (every sample rejected, or nothing settled yet) — but a
-    // measured wait is still a real data point, so do not throw it away.
+  if (mu === 0) {
+    // No usable rate at all (every sample rejected, or nothing settled yet) —
+    // but a measured wait is still a real data point, so do not throw it away.
     return meanTtft > 0
       ? `${theme.fg("dim", "τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
       : "";

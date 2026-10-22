@@ -96,7 +96,9 @@ ok(activeTimers === 0, "timer cleared on message_end", `active=${activeTimers}`)
 // chars=400 -> tokEst = ceil(400/4)=100 tokens over 2.0s = 50 tps
 // ============================================================
 fire("session_start", {});
-ok(num(statuses["tps"]) !== num(statuses["tps"]) || statuses["tps"] === undefined, "session_start clears status", `status=${statuses["tps"]}`);
+// NB: `NaN !== NaN` is always true, so the old form of this check could never
+// fail — assert the real condition instead.
+ok(statuses["tps"] === undefined, "session_start clears status", `status=${statuses["tps"]}`);
 T = 5000;
 fire("message_start", asst());
 T = 5000; // first token immediately
@@ -715,6 +717,47 @@ T = 1_040_000; // 39s of silence, no shutdown event ever arrives
 (lastIntervalCb as any)?.();
 ok(!(p4.status["tps"] ?? "").includes("· 1a"), "a dead token-producing agent is reaped", `status=${p4.status["tps"]}`);
 p4.fire("session_shutdown", {});
+
+// ============================================================
+// Test 25: idling past the 60s rolling window must not make the
+// settled readout claim `0.0 tps`.
+// seriesAvg() returned 0 for an empty window, so any repaint after
+// a pause (here: an abort) rendered a rate of zero for a session
+// with real history — and that string became lastFinal, sticking.
+// ============================================================
+const idle = mkSession(true, "idle-1");
+tpsMeter(idle.api);
+T = 2_000_000;
+idle.fire("session_start", {});
+idle.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 2_000_000 });
+T = 2_000_400;
+idle.fire("message_start", asst());
+T = 2_000_500;
+idle.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "i".repeat(800) },
+});
+T = 2_008_000;
+idle.fire("message_end", asst({ usage: { output: 400 } }));
+const settled = idle.status["tps"] ?? "";
+ok(approx(num(settled), 53, 1), "baseline settled rate", `status=${settled}`);
+// 90s of idling, then a request the user aborts before any token
+T = 2_098_000;
+idle.fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: 2_098_000 });
+T = 2_118_000;
+idle.fire("agent_end", {});
+{
+  const st = idle.status["tps"] ?? "";
+  ok(!st.includes("0.0 tps"), "an empty rolling window does not read as 0.0 tps", `status=${st}`);
+  ok(approx(num(st), 53, 1), "it falls back to the session mean", `got ${num(st)} (${st})`);
+}
+// …and the stale string must not have been recorded as the new lastFinal either
+T = 2_200_000;
+idle.fire("turn_start", { type: "turn_start", turnIndex: 2, timestamp: 2_200_000 });
+T = 2_201_000;
+idle.fire("agent_end", {});
+ok(!(idle.status["tps"] ?? "").includes("0.0 tps"), "and it does not stick either", `status=${idle.status["tps"]}`);
+idle.fire("session_shutdown", {});
 
 // --- restore + summary ---
 Date.now = realNow;

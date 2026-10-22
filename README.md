@@ -150,7 +150,9 @@ Notes:
 
 ## Stats
 
-- **avg**: rolling 60-second window (resets older samples)
+- **avg**: rolling 60-second window (older samples drop out). Once the window is
+  empty — more than a minute of idling — it falls back to μ rather than reporting
+  a rate of zero that nothing is producing
 - **μ**: all-time mean across the session
 - **p95**: 95th percentile, all-time (up to 500 samples)
 - **τ**: mean time-to-first-token across the session, from its own series
@@ -174,10 +176,11 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 65
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 69
 assertions over the token math, τ anchoring, the pre-message wait window, the
 buffered-replay guard, real-usage-vs-fallback, abort cleanup, sparkline
-memoization, merged-total accounting, and subagent isolation.
+memoization, merged-total accounting, subagent isolation, and the idle-window
+fallback.
 
 Known limitation: two UI-owning sessions in the same cwd share one hub, and the
 `wake` slot in it — only the most recently started one is repainted when a
