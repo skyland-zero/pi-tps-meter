@@ -89,11 +89,17 @@ never draw. This extension therefore splits the work:
   paints one merged total — its own rate plus Σ of every agent's rate — marked
   with `Σ` and the live agent count (`· 3a`). When everything has settled it
   paints the usual sparkline/avg/μ/p95 readout, prefixed with `Σ` once subagent
-  messages are part of that series.
+  data is part of that series.
+
+Every UI-owning session in the process registers its own repaint callback, so a
+child starting or stopping wakes all of them — two pi sessions sharing a cwd share
+one hub, and one of them must not go stale because the other started later.
 
 A child that is still waiting for its first token has no rate to report, so the
-parent shows the longest such wait as τ rather than `Σ0.0 tps`. Settled agent
-messages fold their τ into the parent's mean as well.
+parent shows the longest such wait as τ rather than `Σ0.0 tps`, and `Σ` marks the
+TTFT mean too: an agent whose rate was rejected as a flush still contributed its
+time-to-first-token. Settled agent messages fold their τ into the parent's mean
+as well.
 
 Two constants at the top of `extensions/tps-meter.ts` tune it:
 
@@ -176,15 +182,11 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 69
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 76
 assertions over the token math, τ anchoring, the pre-message wait window, the
 buffered-replay guard, real-usage-vs-fallback, abort cleanup, sparkline
 memoization, merged-total accounting, subagent isolation, and the idle-window
 fallback.
-
-Known limitation: two UI-owning sessions in the same cwd share one hub, and the
-`wake` slot in it — only the most recently started one is repainted when a
-subagent starts or stops. Both still fold settled samples in via the sink set.
 
 ## Author
 

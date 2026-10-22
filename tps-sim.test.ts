@@ -553,6 +553,11 @@ fire("agent_end", {}); // aborted before any assistant message
 ok(activeTimers === 0, "abort during the wait stops the ticker", `active=${activeTimers}`);
 ok(!(statuses["tps"] ?? "").includes("τ"), "abort during the wait leaves no stuck τ", `status=${statuses["tps"]}`);
 
+// Park the single-session harness so its wake callback stops being one of the
+// sessions `wakeAll()` notifies — the multi-session tests below tick
+// `lastIntervalCb` and need it to be the session under test.
+fire("session_shutdown", {});
+
 // ============================================================
 // Review findings
 // ============================================================
@@ -758,6 +763,76 @@ T = 2_201_000;
 idle.fire("agent_end", {});
 ok(!(idle.status["tps"] ?? "").includes("0.0 tps"), "and it does not stick either", `status=${idle.status["tps"]}`);
 idle.fire("session_shutdown", {});
+
+// ============================================================
+// Test 26: two UI sessions sharing one hub are both woken by a
+// child. `wake` used to be a single slot, so only the session
+// that started last was repainted when a subagent began or ended.
+// ============================================================
+const w1 = mkSession(true, "ui-w1");
+const w2 = mkSession(true, "ui-w2");
+const wc = mkSession(false, "wake-child");
+tpsMeter(w1.api);
+tpsMeter(w2.api);
+tpsMeter(wc.api);
+T = 3_000_000;
+w1.fire("session_start", {});
+w2.fire("session_start", {});
+wc.fire("session_start", {});
+T = 3_001_000;
+wc.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 3_001_000 });
+// No explicit tick: the child's wake has to reach BOTH renderers on its own.
+// (With the old single-slot `wake`, the session that started last was the only
+// one repainted and the other kept its previous, blank readout.)
+{
+  const s1 = w1.status["tps"] ?? "";
+  const s2 = w2.status["tps"] ?? "";
+  ok(s1.includes("· 1a"), "first UI session wakes on a child", `w1=${s1 || "<blank>"}`);
+  ok(s2.includes("· 1a"), "second UI session wakes on a child", `w2=${s2 || "<blank>"}`);
+  ok(
+    s1.includes("τ") && s2.includes("τ"),
+    "both show the wait, not a zero rate",
+    `w1=${s1} w2=${s2}`,
+  );
+}
+T = 3_004_000;
+// Advance both renderers and confirm the wait keeps counting within each.
+(lastIntervalCb as any)?.();
+ok((w2.status["tps"] ?? "").includes("τ3.0s"), "the woken session counts the wait up", `w2=${w2.status["tps"]}`);
+w1.fire("session_shutdown", {});
+w2.fire("session_shutdown", {});
+wc.fire("session_shutdown", {});
+
+// ============================================================
+// Test 27: a subagent sample whose rate was rejected still marks
+// the series with Σ, because its τ entered the mean. The marker
+// counts folded data, not accepted samples.
+// ============================================================
+const m1 = mkSession(true, "merge-ui");
+const m2 = mkSession(false, "merge-child");
+tpsMeter(m1.api);
+tpsMeter(m2.api);
+T = 4_000_000;
+m1.fire("session_start", {});
+m2.fire("session_start", {});
+m2.fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 4_000_000 });
+T = 4_001_000;
+m2.fire("message_start", asst());
+T = 4_005_000; // τ = 5.0s
+m2.fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "m".repeat(4000) },
+});
+T = 4_005_600; // 1000 tokens in 0.6s = 1666 tps -> rejected as a flush
+m2.fire("message_end", asst({ usage: { output: 1000 } }));
+{
+  const st = m1.status["tps"] ?? "";
+  ok(st.includes("τ5.0s"), "the agent's τ still reaches the parent", `status=${st}`);
+  ok(st.includes("Σ"), "a τ-only agent sample still marks the series", `status=${st}`);
+  ok(!st.includes("tps"), "its rejected rate is not shown", `status=${st}`);
+}
+m1.fire("session_shutdown", {});
+m2.fire("session_shutdown", {});
 
 // --- restore + summary ---
 Date.now = realNow;

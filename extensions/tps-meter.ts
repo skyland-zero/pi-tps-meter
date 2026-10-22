@@ -166,11 +166,21 @@ interface Hub {
   live: Map<string, AgentLive>;
   /** UI-owning sessions; each folds samples into its own series. */
   sinks: Set<(sample: SettledSample) => void>;
-  /** Nudges the UI session to repaint when a child starts/stops streaming. */
-  wake: (() => void) | undefined;
+  /**
+   * Every UI-owning session's repaint nudge. A set, not a single slot: two UI
+   * sessions can share one hub (same cwd ⇒ same module instance), and the last
+   * one to start must not silence the others.
+   */
+  wake: Set<() => void>;
 }
 
-const HUB_KEY = Symbol.for("pi-tps-meter:hub:v1");
+/**
+ * The key carries a shape version. `Symbol.for` is process-global, so an instance
+ * loaded before a `/reload` and one loaded after it would otherwise rendezvous on
+ * the same object with different field shapes — v1's `wake` was a bare function,
+ * and calling `.add` on it threw. Bump this whenever `Hub` changes shape.
+ */
+const HUB_KEY = Symbol.for("pi-tps-meter:hub:v2");
 
 /**
  * The hub is a `Symbol.for`-keyed global rather than a module-level value
@@ -183,7 +193,7 @@ function hub(): Hub {
   const g = globalThis as unknown as Record<symbol, Hub | undefined>;
   let h = g[HUB_KEY];
   if (!h) {
-    h = { live: new Map(), sinks: new Set(), wake: undefined };
+    h = { live: new Map(), sinks: new Set(), wake: new Set() };
     g[HUB_KEY] = h;
   }
   return h;
@@ -546,7 +556,7 @@ function renderLive(
   return `${sp} ${g} ${lead}${num} ${unit}${liveTail}${t}`;
 }
 
-function renderFinal(s: Series, ttf: Series, theme: any): string {
+function renderFinal(s: Series, meanTtft: number, theme: any): string {
   const mu = seriesMean(s);
   // The rolling window is empty after a minute of idling, and averaging nothing
   // used to yield 0 — so an abort (or any repaint) after a pause made the
@@ -558,23 +568,24 @@ function renderFinal(s: Series, ttf: Series, theme: any): string {
   const avg = windowAvg > 0 ? windowAvg : mu;
   // Mean TTFT sits next to μ/p95 as the same kind of number: a session summary.
   // (Live shows the current turn's τ; settled shows the average of all turns.)
-  const meanTtft = seriesMean(ttf);
   const t = meanTtft > 0
     ? ` ${theme.fg("dim", "· τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
     : "";
+  // Σ marks a series that contains another session's data (MERGE_STATS). It has
+  // to apply to the τ-only readout too: an agent's rejected rate still feeds its
+  // TTFT into this mean.
+  const lead = s.merged > 0 ? theme.fg("dim", "Σ ") : "";
 
   if (mu === 0) {
     // No usable rate at all (every sample rejected, or nothing settled yet) —
     // but a measured wait is still a real data point, so do not throw it away.
     return meanTtft > 0
-      ? `${theme.fg("dim", "τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
+      ? `${lead}${theme.fg("dim", "τ")}${ttftColor(meanTtft, fmtMs(meanTtft), theme)}`
       : "";
   }
 
   const p95 = seriesP95(s);
   const sp = sparkline(s, theme);
-  // Σ marks a series that also contains subagent messages (MERGE_STATS).
-  const lead = s.merged > 0 ? theme.fg("dim", "Σ ") : "";
   const a = speedColor(avg, fmt(avg), theme);
   const sep = theme.fg("dim", "·");
   const m = `${theme.fg("dim", "μ")} ${speedColor(mu, fmt(mu), theme)}`;
@@ -607,8 +618,18 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // sessions (pi caches a module per cwd), so anything belonging to *this*
   // session lives here and nowhere else.
   const series = newSeries();
-  /** Parallel series for time-to-first-token (ms), so τ has its own mean. */
-  const ttftSeries = newSeries();
+  /**
+   * TTFT only ever needs a mean, so it keeps a running sum instead of a ring
+   * buffer — no window, no sparkline, no p95, and none of the ~5KB that
+   * `newSeries()` would allocate for them.
+   */
+  let ttftSum = 0;
+  let ttftCount = 0;
+  const ttftPush = (ms: number): void => {
+    ttftSum += ms;
+    ttftCount++;
+  };
+  const ttftMean = (): number => (ttftCount === 0 ? 0 : ttftSum / ttftCount);
   let ownsUI = true;
   let ctxRef: any = null;
   let sid = "";
@@ -643,12 +664,12 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   const sink = (sample: SettledSample): void => {
     if (!ownsUI) return;
     if (MERGE_STATS) {
-      // A rejected rate (buffered replay) still carries a valid TTFT.
-      if (sample.tps > 0) {
-        seriesPush(series, sample.tps);
-        series.merged++;
-      }
-      if (sample.ttftMs > 0) statPush(ttftSeries, sample.ttftMs);
+      // Σ marks a series that contains another session's data, so count the fold
+      // rather than the sample: a rejected rate still carries the agent's TTFT,
+      // and a series whose τ mean includes subagents has to say so.
+      if (sample.tps > 0 || sample.ttftMs > 0) series.merged++;
+      if (sample.tps > 0) seriesPush(series, sample.tps);
+      if (sample.ttftMs > 0) ttftPush(sample.ttftMs);
     }
     paint();
   };
@@ -658,6 +679,11 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (!ownsUI || !MERGE_AGENTS) return;
     startTick();
     paint();
+  }
+
+  /** Wake every UI-owning session sharing this hub (children call this). */
+  function wakeAll(): void {
+    for (const fn of H.wake) fn();
   }
 
   function startTick(): void {
@@ -723,7 +749,10 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       return { ms: nowMs - streamStartMs, waiting: true };
     }
     if (pending()) return { ms: nowMs - turnAnchorMs, waiting: true };
-    if (agents.ttftMs > 0) return { ms: agents.ttftMs, waiting: true };
+    // Gate on there being an agent at all, not on the value being non-zero: on
+    // the instant of turn_start the wait is 0ms, and testing `> 0` fell through
+    // to the normal branch and painted `0.0 tps · 1a` for one frame.
+    if (agents.active > 0) return { ms: agents.ttftMs, waiting: true };
     return null;
   }
 
@@ -763,7 +792,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       return;
     }
 
-    const txt = renderFinal(series, ttftSeries, ctxRef.ui.theme);
+    const txt = renderFinal(series, ttftMean(), ctxRef.ui.theme);
     if (txt) lastFinal = txt;
     ctxRef.ui.setStatus("tps", txt || lastFinal || undefined);
     stopTick();
@@ -806,13 +835,14 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       if (!childReports) return;
       sid = sessionId(ctx);
       entry = ensureEntry();
-      H.wake?.();
+      wakeAll();
       return;
     }
 
     // Parent: private series reset, and become the hub's renderer.
     resetSeries(series);
-    resetSeries(ttftSeries);
+    ttftSum = 0;
+    ttftCount = 0;
     streaming = false;
     streamStartMs = 0;
     turnAnchorMs = 0;
@@ -825,7 +855,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     spinPhase = 0;
     stopTick();
     H.sinks.add(sink);
-    H.wake = wake;
+    H.wake.add(wake);
     ctxRef.ui.setStatus("tps", undefined);
   });
 
@@ -856,7 +886,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       entry.tokens = 0;
       entry.streaming = true;
       entry.lastActiveMs = now();
-      H.wake?.();
+      wakeAll();
       return;
     }
 
@@ -883,7 +913,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       entry.streaming = true;
       entry.lastActiveMs = now();
       deltaCount = 0;
-      H.wake?.();
+      wakeAll();
       return;
     }
 
@@ -958,7 +988,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
         const sample: SettledSample = { tps: rate, tokens, ttftMs };
         for (const fn of H.sinks) fn(sample);
       }
-      H.wake?.();
+      wakeAll();
       return;
     }
 
@@ -971,7 +1001,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
 
     // A wait with no answer is still a data point: record the TTFT even when the
     // rate is unusable (tiny/empty response, buffered replay).
-    if (ttftMs > 0) statPush(ttftSeries, ttftMs);
+    if (ttftMs > 0) ttftPush(ttftMs);
     // Tiny/empty responses carry no rate signal — keep the previous final
     // readout instead of leaving a stale live gauge in the footer.
     if (tokens > 0 && tpsTrustworthy(decodeMs, tokens)) {
@@ -990,7 +1020,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       if (!childReports) return;
       idleEntry();
       turnAnchorMs = 0;
-      H.wake?.();
+      wakeAll();
       return;
     }
 
@@ -1009,13 +1039,13 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     turnAnchorMs = 0;
     if (ownsUI) {
       H.sinks.delete(sink);
-      if (H.wake === wake) H.wake = undefined;
+      H.wake.delete(wake);
     } else if (sid) {
       H.live.delete(sid);
       entry = null;
       // Let the renderer settle back to its own readout right away instead of
       // waiting for the next tick to notice the agent is gone.
-      H.wake?.();
+      wakeAll();
     }
   });
 }
