@@ -507,6 +507,50 @@ c2.fire("message_end", asst({ usage: { output: 100 } }));
 c2.fire("session_shutdown", {});
 p2.fire("session_shutdown", {});
 
+// ============================================================
+// Test 18: τ is rendered during the pre-message window.
+// turn_start -> assistant message_start is the longest part of the
+// wait and produces no events at all. The ticker used to start at
+// message_start, so the bar stayed frozen while pi showed its own
+// "working" spinner, then τ appeared already large (τ14.2s).
+// ============================================================
+fire("session_start", {});
+T = 500000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 500000 });
+ok(activeTimers === 1, "ticker starts at turn_start, not message_start", `active=${activeTimers}`);
+T = 506000;
+(lastIntervalCb as any)?.();
+{
+  const live = statuses["tps"] ?? "";
+  ok(live.includes("τ6.0s"), "τ visible while pi is still 'working'", `live=${live}`);
+  ok(!live.includes("tps"), "no rate yet in the pre-message window", `live=${live}`);
+}
+T = 514200;
+// This is where the old build first painted: τ would have popped in at 14.2s.
+fire("message_start", asst());
+(lastIntervalCb as any)?.();
+{
+  const live = statuses["tps"] ?? "";
+  ok(live.includes("τ14.2s"), "τ keeps the turn_start anchor across message_start", `live=${live}`);
+}
+T = 514400; // first token at +14.4s from turn_start
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "text_delta", delta: "u".repeat(400) },
+});
+T = 514500;
+(lastIntervalCb as any)?.();
+ok((statuses["tps"] ?? "").includes("τ14.4s"), "first token locks the full τ", `live=${statuses["tps"]}`);
+// Abort mid-wait: a pending anchor must not keep the bar live forever.
+fire("session_start", {});
+T = 600000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 600000 });
+ok(activeTimers === 1, "pending turn keeps the ticker up", `active=${activeTimers}`);
+T = 603000;
+fire("agent_end", {}); // aborted before any assistant message
+ok(activeTimers === 0, "abort during the wait stops the ticker", `active=${activeTimers}`);
+ok(!(statuses["tps"] ?? "").includes("τ"), "abort during the wait leaves no stuck τ", `status=${statuses["tps"]}`);
+
 // --- restore + summary ---
 Date.now = realNow;
 console.log("\n" + (failures === 0 ? "ALL TESTS PASSED ✅" : `${failures} TEST(S) FAILED ❌`));

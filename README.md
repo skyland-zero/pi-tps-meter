@@ -11,8 +11,9 @@ pi install npm:pi-tps-meter
 
 ## Features
 
-**While waiting for the first token** — τ counts up live, so the wait is visible
-*while it happens* instead of looking like a stall:
+**While waiting for the first token** — τ starts counting the instant the request
+leaves, i.e. from pi's first "working" frame, so the wait is visible *while it
+happens* instead of looking like a stall:
 ```
 ⠹ ▕···········▏ τ1.4s
 ```
@@ -54,6 +55,10 @@ long you sit there with nothing on screen, tps is how fast it then arrives.
   assembly, provider queueing, prompt prefill, reasoning preamble — not just the
   assistant message's own streaming window. If a message arrives with no turn
   boundary before it, the anchor falls back to `message_start`.
+- **The bar ticks from `turn_start`, not from the assistant message.** That gap
+  is the longest and least forgiving part of the wait and it produces no events
+  at all: waiting for `message_start` left the footer frozen for exactly the
+  seconds τ exists to expose, and then τ popped in already reading 14s.
 - **First token** is the first non-empty `text_delta`, `thinking_delta`, or
   `toolcall_delta`. Metadata events (`*_start`, empty deltas) do not stop the
   wait. A reasoning model's thinking counts as an answer arriving, which is what
@@ -157,10 +162,10 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 45
-assertions over the token math, τ anchoring, the buffered-replay guard,
-real-usage-vs-fallback, abort cleanup, sparkline memoization, and subagent
-isolation.
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 53
+assertions over the token math, τ anchoring, the pre-message wait window, the
+buffered-replay guard, real-usage-vs-fallback, abort cleanup, sparkline
+memoization, and subagent isolation.
 
 ## Author
 

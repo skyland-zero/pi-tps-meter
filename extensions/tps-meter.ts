@@ -677,14 +677,29 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   /**
    * TTFT to put on the live bar: this session's own request if it has one, else
    * a waiting agent's (so a subagent's cold start does not read as `0.0 tps`).
+   *
+   * The pending window — `turn_start` fired, no assistant message yet — counts
+   * too. That is the longest and least forgiving part of the wait (request
+   * assembly + provider queueing + prefill) and none of it produces events, so
+   * if the bar did not tick here τ would appear late, already large.
    */
   function liveTtft(nowMs: number, agentWaitMs: number): LiveTtft | null {
     if (streaming && streamStartMs > 0) {
       if (firstTokenMs > 0) return { ms: firstTokenMs - streamStartMs, waiting: false };
       return { ms: nowMs - streamStartMs, waiting: true };
     }
+    if (pending()) return { ms: nowMs - turnAnchorMs, waiting: true };
     if (agentWaitMs > 0) return { ms: agentWaitMs, waiting: true };
     return null;
+  }
+
+  /**
+   * A request is in flight but has no assistant message yet: `turn_start` landed
+   * and nothing has consumed its anchor. No message, no deltas — but this is
+   * precisely the wait τ is about, so it has to be rendered.
+   */
+  function pending(): boolean {
+    return turnAnchorMs > 0;
   }
 
   /** Single render entry point: live while anything streams, else settled final. */
@@ -696,7 +711,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       : { sum: 0, count: 0, active: 0, waitMs: 0 };
     const own = rate(streamTokens, firstTokenMs > 0 ? firstTokenMs : streamStartMs, nowMs);
 
-    if (streaming || agents.active > 0) {
+    if (streaming || pending() || agents.active > 0) {
       const total = own + agents.sum;
       if (total > aggMax) aggMax = total;
       else if (aggMax > GAUGE_FLOOR) aggMax *= 0.995; // slow decay, like sparkMax
@@ -787,9 +802,16 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // assembly and any provider-side queueing — instead of only the assistant
   // message's own streaming window. The anchor is consumed by the next assistant
   // `message_start` (one turn = one model request = one assistant message).
+  //
+  // The ticker starts here, not at `message_start`: message_start only fires once
+  // the provider starts streaming, so waiting for it would keep the bar frozen
+  // for exactly the seconds τ is supposed to expose, and τ would then pop in at
+  // whatever value it had already accumulated.
   pi.on("turn_start", async (event) => {
     const ts = typeof event.timestamp === "number" && event.timestamp > 0 ? event.timestamp : now();
     turnAnchorMs = ts;
+    if (!ownsUI) return; // children report, never render or allocate a timer
+    startTick();
   });
 
   pi.on("message_start", async (event, ctx) => {
@@ -919,11 +941,15 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (!ownsUI) {
       if (!childReports) return;
       idleEntry();
+      turnAnchorMs = 0;
       H.wake?.();
       return;
     }
 
+    // Drop an anchor whose assistant message never arrived (abort during the
+    // wait); otherwise `pending()` would keep the bar live forever.
     streaming = false;
+    turnAnchorMs = 0;
     paint();
   });
 
@@ -932,6 +958,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
   // it, so it would keep repainting the footer with a stale ctx indefinitely.
   pi.on("session_shutdown", async () => {
     stopTick();
+    turnAnchorMs = 0;
     if (ownsUI) {
       H.sinks.delete(sink);
       if (H.wake === wake) H.wake = undefined;
