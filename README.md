@@ -61,11 +61,16 @@ long you sit there with nothing on screen, tps is how fast it then arrives.
 - **Live vs settled**: while a request is in flight the bar shows the *current*
   turn's τ counting up, then locking; the settled readout shows the *mean* τ
   across the session, next to μ and p95. Same split the tps number already used.
-- **Buffered replay guard**: a long τ followed by a flood of tokens is the
-  upstream flushing a finished answer, not a decode rate — 22s of waiting then
-  1000 tokens in 0.9s would otherwise read as an impossible 1147 tps. Decode
-  windows shorter than 200ms, or shorter than half a τ above 1s, are dropped
-  from the tps series. **Their τ is still recorded**, because the wait was real.
+- **Buffered replay guard**: a rate above 1000 tps is the upstream flushing a
+  finished answer, not decoding it — 1000 tokens in 0.9s would otherwise read as
+  an impossible 1147 tps. Such samples still contribute their τ, because the
+  wait was real.
+- The guard is an **absolute rate ceiling, never a comparison against τ**. An
+  earlier version dropped any decode shorter than half the TTFT; with a 53s wait
+  that silently discarded every turn shorter than 26s of generation, leaving a
+  footer that showed only `τ52.9s`. A long τ is usually hidden reasoning (many
+  providers do not stream thinking deltas) and says nothing about how fast the
+  answer then decodes.
 
 ## Subagents
 
@@ -152,7 +157,7 @@ npm test
 ```
 
 `tps-sim.test.ts` drives the extension through pi's real event sequence with a
-mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 42
+mocked `ExtensionAPI`/ctx, a controllable clock, and instrumented timers — 45
 assertions over the token math, τ anchoring, the buffered-replay guard,
 real-usage-vs-fallback, abort cleanup, sparkline memoization, and subagent
 isolation.

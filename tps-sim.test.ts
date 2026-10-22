@@ -382,6 +382,33 @@ fire("message_end", asst({ usage: { output: 250 } }));
 }
 
 // ============================================================
+// Test 14b: a long τ (hidden reasoning / slow provider) must NOT
+// disqualify the decode that follows it.
+// Regression: the guard used to reject any decode shorter than
+// half the TTFT, so a τ above ~2x the generation time discarded
+// every sample and the footer showed only `τ52.9s` — no tps.
+// τ = 52.9s, decode 3.0s, 150 tokens => 50 tps: perfectly normal
+// ============================================================
+fire("session_start", {});
+T = 146000;
+fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 146000 });
+T = 198900; // 52.9s before the model says anything observable
+fire("message_start", asst());
+fire("message_update", {
+  ...asst(),
+  assistantMessageEvent: { type: "thinking_delta", delta: "t".repeat(40) },
+});
+T = 201900; // 3.0s of decoding, 150 real tokens
+fire("message_end", asst({ usage: { output: 150 } }));
+{
+  const st = statuses["tps"] ?? "";
+  const v = num(st);
+  ok(st.includes("tps"), "long τ still yields a tps sample", `status=${st}`);
+  ok(st.includes("τ52.9s"), "long τ is reported honestly", `status=${st}`);
+  ok(approx(v, 50), "decode rate after a long τ is 50 tps", `got ${v} (${st})`);
+}
+
+// ============================================================
 // Test 15: while waiting for the first token the bar counts τ up
 // and shows no tps at all (regression: used to read `0.0 tps`,
 // which looked like a stall)

@@ -41,10 +41,12 @@
  *     is assembled — so it is the end-to-end wait the user actually feels, not
  *     just the time spent inside the provider call. Falls back to the assistant
  *     `message_start` if no turn boundary preceded the message.
- *   - Buffered-replay guard: a long TTFT followed by a flood of tokens is the
- *     provider flushing the whole answer at once, not a decode rate (22s TTFT
- *     then 1000 tokens in 0.9s would read as an impossible 1147 tps). Such
- *     samples still contribute their TTFT but are dropped from the tps series.
+ *   - Buffered-replay guard: a decode rate above MAX_PLAUSIBLE_TPS is the
+ *     provider flushing a finished answer, not decoding it (1000 tokens in 0.9s
+ *     would read as an impossible 1147 tps). Such samples still contribute their
+ *     TTFT but are dropped from the tps series. The guard is an absolute rate
+ *     ceiling, never a comparison against TTFT — a long wait is usually hidden
+ *     reasoning and must not disqualify the decode that follows it.
  *
  * Performance:
  *   - The per-delta path stays allocation-free and clock-free: one string-length
@@ -82,6 +84,16 @@ const TTFT_MED_MS = 3_000;
  * denominator is noise (first-token jitter, a single flushed chunk).
  */
 const MIN_DECODE_MS = 200;
+/**
+ * Fastest rate an autoregressive decoder can actually sustain. Anything above
+ * this is a buffered flush wearing a decoder's clothes, not a real measurement.
+ *
+ * Deliberately an absolute ceiling rather than a comparison against TTFT: a long
+ * TTFT is usually a hidden reasoning phase (providers that do not stream thinking
+ * deltas) and says nothing about the decode window, so relating the two throws
+ * away perfectly good samples.
+ */
+const MAX_PLAUSIBLE_TPS = 1_000;
 
 /** Fold concurrent subagent throughput into this session's footer total. */
 const MERGE_AGENTS = true;
@@ -251,16 +263,22 @@ function rate(tokens: number, refMs: number, nowMs: number): number {
  *
  * Two rejections, both about a denominator that carries no signal:
  *   - shorter than MIN_DECODE_MS: first-token jitter dominates the quotient.
- *   - shorter than half a long TTFT: the classic gateway-buffered replay, where
- *     the upstream holds the finished answer and flushes it in one burst. The
- *     numerator is real but the elapsed time is not the generation time, so the
- *     quotient is fiction (22s TTFT + 1000 tokens in 0.9s = "1147 tps").
+ *   - the implied rate exceeds MAX_PLAUSIBLE_TPS: the upstream held the finished
+ *     answer and flushed it, so the elapsed time is not the generation time
+ *     (1000 tokens in 0.9s reads as "1147 tps").
  *
- * The TTFT itself stays trustworthy in both cases — only the rate is dropped.
+ * Note what is deliberately *not* checked: the ratio between decode time and
+ * TTFT. A slow first token (hidden reasoning, a cold prompt, a busy provider) is
+ * orthogonal to how fast the answer then decodes, and rejecting short decodes
+ * after long waits silently discarded every legitimate turn from a reasoning
+ * model — leaving a footer that showed only τ.
+ *
+ * The TTFT itself stays trustworthy in both rejected cases — only the rate is
+ * dropped, and the wait is still recorded.
  */
-function tpsTrustworthy(decodeMs: number, ttftMs: number): boolean {
+function tpsTrustworthy(decodeMs: number, tokens: number): boolean {
   if (decodeMs < MIN_DECODE_MS) return false;
-  return !(ttftMs >= TTFT_FAST_MS && decodeMs < ttftMs * 0.5);
+  return tokens / (decodeMs / 1000) <= MAX_PLAUSIBLE_TPS;
 }
 
 function fmt(v: number): string {
@@ -865,7 +883,8 @@ export default function tpsMeter(pi: ExtensionAPI): void {
       const ttftMs = entry.firstTokenMs > 0 ? entry.firstTokenMs - entry.startMs : 0;
       idleEntry();
       if (MERGE_STATS && (tokens > 0 || ttftMs > 0)) {
-        const rate = tpsTrustworthy(decodeMs, ttftMs) && tokens > 0 ? tokens / (decodeMs / 1000) : 0;
+        const rate =
+          tokens > 0 && tpsTrustworthy(decodeMs, tokens) ? tokens / (decodeMs / 1000) : 0;
         const sample: SettledSample = { tps: rate, tokens, ttftMs };
         for (const fn of H.sinks) fn(sample);
       }
@@ -885,7 +904,7 @@ export default function tpsMeter(pi: ExtensionAPI): void {
     if (ttftMs > 0) statPush(ttftSeries, ttftMs);
     // Tiny/empty responses carry no rate signal — keep the previous final
     // readout instead of leaving a stale live gauge in the footer.
-    if (tokens > 0 && tpsTrustworthy(decodeMs, ttftMs)) {
+    if (tokens > 0 && tpsTrustworthy(decodeMs, tokens)) {
       seriesPush(series, tokens / (decodeMs / 1000));
     }
     paint();
